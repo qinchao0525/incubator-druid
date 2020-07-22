@@ -21,9 +21,9 @@ package org.apache.druid.query.aggregation.datasketches.hll;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
-import com.yahoo.sketches.hll.HllSketch;
-import com.yahoo.sketches.hll.TgtHllType;
-import com.yahoo.sketches.hll.Union;
+import org.apache.datasketches.hll.HllSketch;
+import org.apache.datasketches.hll.TgtHllType;
+import org.apache.datasketches.hll.Union;
 import org.apache.druid.query.aggregation.AggregatorFactory;
 import org.apache.druid.query.aggregation.AggregatorUtil;
 import org.apache.druid.query.aggregation.PostAggregator;
@@ -127,8 +127,8 @@ public class HllSketchUnionPostAggregator implements PostAggregator
     return getClass().getSimpleName() + "{" +
         "name='" + name + '\'' +
         ", fields=" + fields +
-        "lgK=" + lgK +
-        "tgtHllType=" + tgtHllType +
+        ", lgK=" + lgK +
+        ", tgtHllType=" + tgtHllType +
         "}";
   }
 

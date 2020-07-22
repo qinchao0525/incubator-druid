@@ -5,7 +5,7 @@ exports[`auto-form snapshot matches snapshot 1`] = `
   class="auto-form"
 >
   <div
-    class="bp3-form-group"
+    class="bp3-form-group form-group-with-info"
   >
     <label
       class="bp3-label"
@@ -29,6 +29,7 @@ exports[`auto-form snapshot matches snapshot 1`] = `
             autocomplete="off"
             class="bp3-input"
             min="0"
+            placeholder=""
             style="padding-right: 10px;"
             type="text"
             value=""
@@ -90,7 +91,7 @@ exports[`auto-form snapshot matches snapshot 1`] = `
     </div>
   </div>
   <div
-    class="bp3-form-group"
+    class="bp3-form-group form-group-with-info"
   >
     <label
       class="bp3-label"
@@ -175,7 +176,7 @@ exports[`auto-form snapshot matches snapshot 1`] = `
     </div>
   </div>
   <div
-    class="bp3-form-group"
+    class="bp3-form-group form-group-with-info"
   >
     <label
       class="bp3-label"
@@ -194,6 +195,7 @@ exports[`auto-form snapshot matches snapshot 1`] = `
       >
         <input
           class="bp3-input"
+          placeholder=""
           style="padding-right: 10px;"
           type="text"
           value=""
@@ -202,7 +204,7 @@ exports[`auto-form snapshot matches snapshot 1`] = `
     </div>
   </div>
   <div
-    class="bp3-form-group"
+    class="bp3-form-group form-group-with-info"
   >
     <label
       class="bp3-label"
@@ -243,7 +245,7 @@ exports[`auto-form snapshot matches snapshot 1`] = `
     </div>
   </div>
   <div
-    class="bp3-form-group"
+    class="bp3-form-group form-group-with-info"
   >
     <label
       class="bp3-label"
@@ -284,7 +286,7 @@ exports[`auto-form snapshot matches snapshot 1`] = `
     </div>
   </div>
   <div
-    class="bp3-form-group"
+    class="bp3-form-group form-group-with-info"
   >
     <label
       class="bp3-label"
@@ -300,11 +302,12 @@ exports[`auto-form snapshot matches snapshot 1`] = `
     >
       <textarea
         class="bp3-input bp3-fill"
+        placeholder=""
       />
     </div>
   </div>
   <div
-    class="bp3-form-group"
+    class="bp3-form-group form-group-with-info"
   >
     <label
       class="bp3-label"
@@ -319,8 +322,8 @@ exports[`auto-form snapshot matches snapshot 1`] = `
       class="bp3-form-content"
     >
       <div
-        class=" ace_editor ace-tm"
-        id="ace-editor"
+        class=" ace_editor ace-tm json-input"
+        id="brace-editor"
         style="width: 100%; height: 8vh;"
       >
         <textarea
@@ -410,7 +413,7 @@ exports[`auto-form snapshot matches snapshot 1`] = `
     </div>
   </div>
   <div
-    class="bp3-form-group"
+    class="bp3-form-group form-group-with-info"
   >
     <label
       class="bp3-label"
@@ -425,8 +428,8 @@ exports[`auto-form snapshot matches snapshot 1`] = `
       class="bp3-form-content"
     >
       <div
-        class=" ace_editor ace-tm"
-        id="ace-editor"
+        class=" ace_editor ace-tm json-input"
+        id="brace-editor"
         style="width: 100%; height: 8vh;"
       >
         <textarea

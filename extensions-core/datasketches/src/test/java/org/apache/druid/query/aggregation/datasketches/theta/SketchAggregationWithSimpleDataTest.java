@@ -34,10 +34,10 @@ import org.apache.druid.query.groupby.GroupByQuery;
 import org.apache.druid.query.groupby.GroupByQueryConfig;
 import org.apache.druid.query.groupby.GroupByQueryRunnerTest;
 import org.apache.druid.query.groupby.ResultRow;
-import org.apache.druid.query.select.SelectResultValue;
 import org.apache.druid.query.timeseries.TimeseriesResultValue;
 import org.apache.druid.query.topn.DimensionAndMetricValueExtractor;
 import org.apache.druid.query.topn.TopNResultValue;
+import org.apache.druid.testing.InitializedNullHandlingTest;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Rule;
@@ -48,7 +48,7 @@ import org.junit.runners.Parameterized;
 
 import java.io.File;
 import java.io.IOException;
-import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -57,7 +57,7 @@ import java.util.List;
  *
  */
 @RunWith(Parameterized.class)
-public class SketchAggregationWithSimpleDataTest
+public class SketchAggregationWithSimpleDataTest extends InitializedNullHandlingTest
 {
   @Rule
   public final TemporaryFolder tempFolder = new TemporaryFolder();
@@ -269,30 +269,6 @@ public class SketchAggregationWithSimpleDataTest
   }
 
   @Test
-  public void testSimpleDataIngestAndSelectQuery() throws Exception
-  {
-    SketchModule.registerSerde();
-    SketchModule sm = new SketchModule();
-    AggregationTestHelper selectQueryAggregationTestHelper = AggregationTestHelper.createSelectQueryAggregationTestHelper(
-        sm.getJacksonModules(),
-        tempFolder
-    );
-
-    Sequence seq = selectQueryAggregationTestHelper.runQueryOnSegments(
-        ImmutableList.of(s1, s2),
-        readFileFromClasspathAsString("select_query.json")
-    );
-
-    Result<SelectResultValue> result = (Result<SelectResultValue>) Iterables.getOnlyElement(seq.toList());
-    Assert.assertEquals(DateTimes.of("2014-10-20T00:00:00.000Z"), result.getTimestamp());
-    Assert.assertEquals(100, result.getValue().getEvents().size());
-    Assert.assertEquals(
-        "AgMDAAAazJMCAAAAAACAPzz9j7pWTMdROWGf15uY1nI=",
-        result.getValue().getEvents().get(0).getEvent().get("pty_country")
-    );
-  }
-
-  @Test
   public void testTopNQueryWithSketchConstant() throws Exception
   {
     AggregationTestHelper topNQueryAggregationTestHelper = AggregationTestHelper.createTopNQueryAggregationTestHelper(
@@ -337,11 +313,11 @@ public class SketchAggregationWithSimpleDataTest
     Assert.assertEquals("product_2", value3.getDimensionValue("product"));
   }
 
-  public static final String readFileFromClasspathAsString(String fileName) throws IOException
+  public static String readFileFromClasspathAsString(String fileName) throws IOException
   {
     return Files.asCharSource(
         new File(SketchAggregationTest.class.getClassLoader().getResource(fileName).getFile()),
-        Charset.forName("UTF-8")
+        StandardCharsets.UTF_8
     ).read();
   }
 }

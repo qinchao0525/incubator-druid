@@ -23,8 +23,8 @@ import {
   HeaderRows,
   isFirstRowHeader,
   normalizeQueryResult,
+  parseSqlQuery,
   shouldIncludeTimestamp,
-  sqlParserFactory,
   SqlQuery,
 } from 'druid-query-toolkit';
 import Hjson from 'hjson';
@@ -32,7 +32,6 @@ import memoizeOne from 'memoize-one';
 import React from 'react';
 import SplitterLayout from 'react-splitter-layout';
 
-import { SQL_FUNCTIONS } from '../../../lib/sql-docs';
 import { QueryPlanDialog } from '../../dialogs';
 import { EditContextDialog } from '../../dialogs/edit-context-dialog/edit-context-dialog';
 import { QueryHistoryDialog } from '../../dialogs/query-history-dialog/query-history-dialog';
@@ -63,11 +62,9 @@ import { RunButton } from './run-button/run-button';
 
 import './query-view.scss';
 
-const parserRaw = sqlParserFactory(SQL_FUNCTIONS.map(sqlFunction => sqlFunction.name));
-
-const parser = memoizeOne((sql: string) => {
+const parser = memoizeOne((sql: string): SqlQuery | undefined => {
   try {
-    return parserRaw(sql);
+    return parseSqlQuery(sql);
   } catch {
     return;
   }
@@ -81,11 +78,13 @@ interface QueryWithContext {
 
 export interface QueryViewProps {
   initQuery: string | undefined;
+  defaultQueryContext?: Record<string, any>;
+  mandatoryQueryContext?: Record<string, any>;
 }
 
 export interface QueryViewState {
   queryString: string;
-  parsedQuery: SqlQuery;
+  parsedQuery?: SqlQuery;
   queryContext: QueryContext;
   wrapQueryLimit: number | undefined;
   autoRun: boolean;
@@ -129,13 +128,6 @@ export class QueryView extends React.PureComponent<QueryViewProps, QueryViewStat
 
   static isExplainQuery(query: string): boolean {
     return /EXPLAIN\sPLAN\sFOR/i.test(query);
-  }
-
-  static wrapInLimitIfNeeded(query: string, limit: number | undefined): string {
-    query = QueryView.trimSemicolon(query);
-    if (!limit) return query;
-    if (QueryView.isExplainQuery(query)) return query;
-    return `SELECT * FROM (${query}\n) LIMIT ${limit}`;
   }
 
   static wrapInExplainIfNeeded(query: string): string {
@@ -182,11 +174,13 @@ export class QueryView extends React.PureComponent<QueryViewProps, QueryViewStat
 
   constructor(props: QueryViewProps, context: any) {
     super(props, context);
+    const { mandatoryQueryContext } = props;
 
     const queryString = props.initQuery || localStorageGet(LocalStorageKeys.QUERY_KEY) || '';
     const parsedQuery = queryString ? parser(queryString) : undefined;
 
-    const queryContext = localStorageGetJson(LocalStorageKeys.QUERY_CONTEXT) || {};
+    const queryContext =
+      localStorageGetJson(LocalStorageKeys.QUERY_CONTEXT) || props.defaultQueryContext || {};
 
     const possibleQueryHistory = localStorageGetJson(LocalStorageKeys.QUERY_HISTORY);
     const queryHistory = Array.isArray(possibleQueryHistory) ? possibleQueryHistory : [];
@@ -251,17 +245,21 @@ export class QueryView extends React.PureComponent<QueryViewProps, QueryViewStat
         if (QueryView.isJsonLike(queryString)) {
           jsonQuery = Hjson.parse(queryString);
         } else {
-          const actualQuery = QueryView.wrapInLimitIfNeeded(queryString, wrapQueryLimit);
-
           jsonQuery = {
-            query: actualQuery,
+            query: queryString,
             resultFormat: 'array',
             header: true,
           };
         }
 
-        if (!isEmptyContext(queryContext)) {
-          jsonQuery.context = Object.assign(jsonQuery.context || {}, queryContext);
+        if (!isEmptyContext(queryContext) || wrapQueryLimit || mandatoryQueryContext) {
+          jsonQuery.context = Object.assign(
+            {},
+            jsonQuery.context || {},
+            queryContext,
+            mandatoryQueryContext || {},
+          );
+          jsonQuery.context.sqlOuterLimit = wrapQueryLimit;
         }
 
         let rawQueryResult: unknown;
@@ -320,14 +318,15 @@ export class QueryView extends React.PureComponent<QueryViewProps, QueryViewStat
       processQuery: async (queryWithContext: QueryWithContext) => {
         const { queryString, queryContext, wrapQueryLimit } = queryWithContext;
 
-        const actualQuery = QueryView.wrapInLimitIfNeeded(queryString, wrapQueryLimit);
-
         const explainPayload: Record<string, any> = {
-          query: QueryView.wrapInExplainIfNeeded(actualQuery),
+          query: QueryView.wrapInExplainIfNeeded(queryString),
           resultFormat: 'object',
         };
 
-        if (!isEmptyContext(queryContext)) explainPayload.context = queryContext;
+        if (!isEmptyContext(queryContext) || wrapQueryLimit) {
+          explainPayload.context = Object.assign({}, queryContext || {});
+          explainPayload.context.sqlOuterLimit = wrapQueryLimit;
+        }
         const result = await queryDruidSql(explainPayload);
 
         return parseQueryPlan(result[0]['PLAN']);
@@ -354,7 +353,7 @@ export class QueryView extends React.PureComponent<QueryViewProps, QueryViewStat
 
   prettyPrintJson(): void {
     this.setState(prevState => ({
-      queryString: Hjson.stringify(Hjson.parse(prevState.queryString)),
+      queryString: JSON.stringify(Hjson.parse(prevState.queryString), null, 2),
     }));
   }
 
@@ -477,18 +476,22 @@ export class QueryView extends React.PureComponent<QueryViewProps, QueryViewStat
     const { queryString, queryContext, loading, result, error, columnMetadata } = this.state;
     const emptyQuery = QueryView.isEmptyQuery(queryString);
 
-    let currentSchema;
-    let currentTable;
+    let currentSchema: string | undefined;
+    let currentTable: string | undefined;
 
-    if (result && result.parsedQuery instanceof SqlQuery) {
+    if (result && result.parsedQuery) {
       currentSchema = result.parsedQuery.getSchema();
       currentTable = result.parsedQuery.getTableName();
     } else if (localStorageGet(LocalStorageKeys.QUERY_KEY)) {
       const defaultQueryString = localStorageGet(LocalStorageKeys.QUERY_KEY);
-      const tempAst = defaultQueryString ? parser(defaultQueryString) : undefined;
-      if (tempAst) {
-        currentSchema = tempAst.getSchema();
-        currentTable = tempAst.getTableName();
+
+      const defaultQueryAst: SqlQuery | undefined = defaultQueryString
+        ? parser(defaultQueryString)
+        : undefined;
+
+      if (defaultQueryAst) {
+        currentSchema = defaultQueryAst.getSchema();
+        currentTable = defaultQueryAst.getTableName();
       }
     }
 
@@ -523,6 +526,7 @@ export class QueryView extends React.PureComponent<QueryViewProps, QueryViewStat
               onExplain={emptyQuery ? undefined : this.handleExplain}
               onHistory={() => this.setState({ historyDialogOpen: true })}
               onPrettier={() => this.prettyPrintJson()}
+              loading={loading}
             />
             {this.renderAutoRunSwitch()}
             {this.renderWrapQueryLimitSelector()}

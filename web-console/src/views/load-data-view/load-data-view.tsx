@@ -31,6 +31,8 @@ import {
   Icon,
   IconName,
   Intent,
+  Menu,
+  MenuItem,
   Popover,
   Switch,
   TextArea,
@@ -48,8 +50,11 @@ import {
   ExternalLink,
   JsonInput,
   Loader,
+  PopoverText,
 } from '../../components';
+import { FormGroupWithInfo } from '../../components/form-group-with-info/form-group-with-info';
 import { AsyncActionDialog } from '../../dialogs';
+import { getLink } from '../../links';
 import { AppToaster } from '../../singletons/toaster';
 import { UrlBaser } from '../../singletons/url-baser';
 import {
@@ -59,12 +64,15 @@ import {
   LocalStorageKeys,
   localStorageSet,
   parseJson,
+  pluralIfNeeded,
   QueryState,
 } from '../../utils';
 import { NUMERIC_TIME_FORMATS, possibleDruidFormatForValues } from '../../utils/druid-time';
 import { updateSchemaWithSample } from '../../utils/druid-type';
 import {
-  changeParallel,
+  adjustIngestionSpec,
+  adjustTuningConfig,
+  cleanSpec,
   DimensionMode,
   DimensionSpec,
   DimensionsSpec,
@@ -72,20 +80,21 @@ import {
   EMPTY_ARRAY,
   EMPTY_OBJECT,
   fillDataSourceNameIfNeeded,
-  fillParser,
+  fillInputFormat,
   FlattenField,
+  getConstantTimestampSpec,
   getDimensionMode,
   getDimensionSpecFormFields,
-  getEmptyTimestampSpec,
   getFilterFormFields,
   getFlattenFieldFormFields,
   getIngestionComboType,
+  getIngestionDocLink,
   getIngestionImage,
   getIngestionTitle,
+  getInputFormatFormFields,
   getIoConfigFormFields,
   getIoConfigTuningFormFields,
   getMetricSpecFormFields,
-  getParseSpecFormFields,
   getPartitionRelatedTuningSpecFormFields,
   getRequiredModule,
   getRollup,
@@ -94,36 +103,35 @@ import {
   getTransformFormFields,
   getTuningSpecFormFields,
   GranularitySpec,
-  hasParallelAbility,
   IngestionComboTypeWithExtra,
   IngestionSpec,
+  InputFormat,
+  inputFormatCanFlatten,
   invalidIoConfig,
   invalidTuningConfig,
   IoConfig,
   isColumnTimestampSpec,
+  isDruidSource,
   isEmptyIngestionSpec,
-  isIngestSegment,
-  isParallel,
   issueWithIoConfig,
-  issueWithParser,
   isTask,
   joinFilter,
   MAX_INLINE_DATA_LENGTH,
   MetricSpec,
   normalizeSpec,
-  Parser,
-  ParseSpec,
-  parseSpecHasFlatten,
   splitFilter,
   TimestampSpec,
   Transform,
   TuningConfig,
   updateIngestionType,
+  upgradeSpec,
 } from '../../utils/ingestion-spec';
 import { deepDelete, deepGet, deepSet } from '../../utils/object-change';
 import {
+  CacheRows,
   ExampleManifest,
-  getOverlordModules,
+  getCacheRowsFromSampleResponse,
+  getProxyOverlordModules,
   HeaderAndRows,
   headerAndRowsFromSampleResponse,
   SampleEntry,
@@ -141,16 +149,25 @@ import {
 import { computeFlattenPathsForData } from '../../utils/spec-utils';
 
 import { ExamplePicker } from './example-picker/example-picker';
-import { FilterTable } from './filter-table/filter-table';
+import { FilterTable, filterTableSelectedColumnName } from './filter-table/filter-table';
+import { LearnMore } from './learn-more/learn-more';
 import { ParseDataTable } from './parse-data-table/parse-data-table';
-import { ParseTimeTable } from './parse-time-table/parse-time-table';
+import {
+  ParseTimeTable,
+  parseTimeTableSelectedColumnName,
+} from './parse-time-table/parse-time-table';
 import { SchemaTable } from './schema-table/schema-table';
-import { TransformTable } from './transform-table/transform-table';
+import {
+  TransformTable,
+  transformTableSelectedColumnName,
+} from './transform-table/transform-table';
 
 import './load-data-view.scss';
 
 function showRawLine(line: SampleEntry): string {
-  const raw = line.raw;
+  if (!line.parsed) return 'No parse';
+  const raw = line.parsed.raw;
+  if (typeof raw !== 'string') return String(raw);
   if (raw.includes('\n')) {
     return `[Multi-line row, length: ${raw.length}]`;
   }
@@ -160,12 +177,17 @@ function showRawLine(line: SampleEntry): string {
   return raw;
 }
 
+function showDruidLine(line: SampleEntry): string {
+  if (!line.parsed) return 'No parse';
+  return `Druid row: ${JSON.stringify(line.parsed)}`;
+}
+
 function showBlankLine(line: SampleEntry): string {
   return line.parsed ? `[Row: ${JSON.stringify(line.parsed)}]` : '[Binary data]';
 }
 
 function getTimestampSpec(headerAndRows: HeaderAndRows | null): TimestampSpec {
-  if (!headerAndRows) return getEmptyTimestampSpec();
+  if (!headerAndRows) return getConstantTimestampSpec();
 
   const timestampSpecs = filterMap(headerAndRows.header, sampleHeader => {
     const possibleFormat = possibleDruidFormatForValues(
@@ -182,7 +204,7 @@ function getTimestampSpec(headerAndRows: HeaderAndRows | null): TimestampSpec {
     timestampSpecs.find(ts => /time/i.test(ts.column)) || // Use a suggestion that has time in the name if possible
     timestampSpecs.find(ts => !NUMERIC_TIME_FORMATS.includes(ts.format)) || // Use a suggestion that is not numeric
     timestampSpecs[0] || // Fall back to the first one
-    getEmptyTimestampSpec() // Ok, empty it is...
+    getConstantTimestampSpec() // Ok, empty it is...
   );
 }
 
@@ -217,7 +239,7 @@ const STEPS: Step[] = [
 
 const SECTIONS: { name: string; steps: Step[] }[] = [
   { name: 'Connect and parse raw data', steps: ['welcome', 'connect', 'parser', 'timestamp'] },
-  { name: 'Transform and configure schema', steps: ['transform', 'filter', 'schema'] },
+  { name: 'Transform data and configure schema', steps: ['transform', 'filter', 'schema'] },
   { name: 'Tune parameters', steps: ['partition', 'tuning', 'publish'] },
   { name: 'Verify and submit', steps: ['spec'] },
 ];
@@ -241,13 +263,14 @@ export interface LoadDataViewProps {
   initSupervisorId?: string;
   initTaskId?: string;
   exampleManifestsUrl?: string;
-  goToTask: (taskId: string | undefined, supervisor?: string) => void;
+  goToIngestion: (taskGroupId: string | undefined, supervisor?: string) => void;
 }
 
 export interface LoadDataViewState {
   step: Step;
   spec: IngestionSpec;
-  cacheKey?: string;
+  specPreview: IngestionSpec;
+  cacheRows?: CacheRows;
   // dialogs / modals
   continueToSpec: boolean;
   showResetConfirm: boolean;
@@ -290,6 +313,7 @@ export interface LoadDataViewState {
   selectedFilterIndex: number;
   selectedFilter?: DruidFilter;
   showGlobalFilter: boolean;
+  newFilterValue?: Record<string, any>;
 
   // for schema
   schemaQueryState: QueryState<{
@@ -313,8 +337,9 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
     let spec = parseJson(String(localStorageGet(LocalStorageKeys.INGESTION_SPEC)));
     if (!spec || typeof spec !== 'object') spec = {};
     this.state = {
-      step: 'welcome',
+      step: 'loading',
       spec,
+      specPreview: spec,
 
       // dialogs / modals
       showResetConfirm: false,
@@ -325,7 +350,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
       columnFilter: '',
       specialColumnsOnly: false,
 
-      // for firehose
+      // for inputSource
       inputQueryState: QueryState.INIT,
 
       // for parser
@@ -381,7 +406,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
   async getOverlordModules() {
     let overlordModules: string[];
     try {
-      overlordModules = await getOverlordModules();
+      overlordModules = await getProxyOverlordModules();
     } catch (e) {
       AppToaster.show({
         message: `Failed to get overlord modules: ${e.message}`,
@@ -395,23 +420,27 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
   }
 
   isStepEnabled(step: Step): boolean {
-    const { spec } = this.state;
-    const ioConfig: IoConfig = deepGet(spec, 'ioConfig') || EMPTY_OBJECT;
-    const parser: Parser = deepGet(spec, 'dataSchema.parser') || EMPTY_OBJECT;
+    const { spec, cacheRows } = this.state;
+    const druidSource = isDruidSource(spec);
+    const ioConfig: IoConfig = deepGet(spec, 'spec.ioConfig') || EMPTY_OBJECT;
 
     switch (step) {
       case 'connect':
         return Boolean(spec.type);
 
       case 'parser':
+        return Boolean(!druidSource && spec.type && !issueWithIoConfig(ioConfig));
+
       case 'timestamp':
+        return Boolean(!druidSource && cacheRows);
+
       case 'transform':
       case 'filter':
       case 'schema':
       case 'partition':
       case 'tuning':
       case 'publish':
-        return Boolean(spec.type && !issueWithIoConfig(ioConfig) && !issueWithParser(parser));
+        return Boolean(cacheRows);
 
       default:
         return true;
@@ -419,40 +448,75 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
   }
 
   private updateStep = (newStep: Step) => {
-    this.doQueryForStep(newStep);
-    this.setState({ step: newStep });
+    this.setState(state => ({ step: newStep, specPreview: state.spec }));
   };
 
-  doQueryForStep(step: Step): any {
+  private updateSpec = (newSpec: IngestionSpec) => {
+    newSpec = normalizeSpec(newSpec);
+    newSpec = upgradeSpec(newSpec);
+    newSpec = adjustIngestionSpec(newSpec);
+    const deltaState: Partial<LoadDataViewState> = { spec: newSpec, specPreview: newSpec };
+    if (!deepGet(newSpec, 'spec.ioConfig.type')) {
+      deltaState.cacheRows = undefined;
+    }
+    this.setState(deltaState as LoadDataViewState);
+    localStorageSet(LocalStorageKeys.INGESTION_SPEC, JSON.stringify(newSpec));
+  };
+
+  private updateSpecPreview = (newSpecPreview: IngestionSpec) => {
+    this.setState({ specPreview: newSpecPreview });
+  };
+
+  private applyPreviewSpec = () => {
+    this.setState(state => {
+      localStorageSet(LocalStorageKeys.INGESTION_SPEC, JSON.stringify(state.specPreview));
+      return { spec: state.specPreview };
+    });
+  };
+
+  private revertPreviewSpec = () => {
+    this.setState(state => ({ specPreview: state.spec }));
+  };
+
+  isPreviewSpecSame() {
+    const { spec, specPreview } = this.state;
+    return spec === specPreview;
+  }
+
+  componentDidUpdate(_prevProps: LoadDataViewProps, prevState: LoadDataViewState) {
+    const { spec, step } = this.state;
+    const { spec: prevSpec, step: prevStep } = prevState;
+    if (spec !== prevSpec || step !== prevStep) {
+      this.doQueryForStep(step !== prevStep);
+    }
+  }
+
+  doQueryForStep(initRun: boolean): any {
+    const { step } = this.state;
+
     switch (step) {
       case 'welcome':
         return this.queryForWelcome();
 
       case 'connect':
-        return this.queryForConnect(true);
+        return this.queryForConnect(initRun);
 
       case 'parser':
-        return this.queryForParser(true);
+        return this.queryForParser(initRun);
 
       case 'timestamp':
-        return this.queryForTimestamp(true);
+        return this.queryForTimestamp(initRun);
 
       case 'transform':
-        return this.queryForTransform(true);
+        return this.queryForTransform(initRun);
 
       case 'filter':
-        return this.queryForFilter(true);
+        return this.queryForFilter(initRun);
 
       case 'schema':
-        return this.queryForSchema(true);
+        return this.queryForSchema(initRun);
     }
   }
-
-  private updateSpec = (newSpec: IngestionSpec) => {
-    newSpec = normalizeSpec(newSpec);
-    this.setState({ spec: newSpec });
-    localStorageSet(LocalStorageKeys.INGESTION_SPEC, JSON.stringify(newSpec));
-  };
 
   renderActionCard(icon: IconName, title: string, caption: string, onClick: () => void) {
     return (
@@ -491,6 +555,8 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
     return (
       <div className={classNames('load-data-view', 'app-view', step)}>
         {this.renderStepNav()}
+        {step === 'loading' && <Loader loading />}
+
         {step === 'welcome' && this.renderWelcomeStep()}
         {step === 'connect' && this.renderConnectStep()}
         {step === 'parser' && this.renderParserStep()}
@@ -505,10 +571,31 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
         {step === 'publish' && this.renderPublishStep()}
 
         {step === 'spec' && this.renderSpecStep()}
-        {step === 'loading' && this.renderLoading()}
 
         {this.renderResetConfirm()}
       </div>
+    );
+  }
+
+  renderApplyButtonBar() {
+    const previewSpecSame = this.isPreviewSpecSame();
+
+    return (
+      <FormGroup className="control-buttons">
+        <Button
+          text="Apply"
+          disabled={previewSpecSame}
+          intent={Intent.PRIMARY}
+          onClick={this.applyPreviewSpec}
+        />
+        {!previewSpecSame && (
+          <Button
+            text="Cancel"
+            disabled={this.isPreviewSpecSame()}
+            onClick={this.revertPreviewSpec}
+          />
+        )}
+      </FormGroup>
     );
   }
 
@@ -539,22 +626,13 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
     );
   }
 
-  renderNextBar(options: {
-    nextStep?: Step;
-    disabled?: boolean;
-    onNextStep?: () => void;
-    onPrevStep?: () => void;
-    prevLabel?: string;
-  }) {
-    const { disabled, onNextStep, onPrevStep, prevLabel } = options;
+  renderNextBar(options: { nextStep?: Step; disabled?: boolean; onNextStep?: () => void }) {
+    const { disabled, onNextStep } = options;
     const { step } = this.state;
     const nextStep = options.nextStep || STEPS[STEPS.indexOf(step) + 1] || STEPS[0];
 
     return (
       <div className="next-bar">
-        {onPrevStep && (
-          <Button className="prev" icon={IconNames.UNDO} text={prevLabel} onClick={onPrevStep} />
-        )}
         <Button
           text={`Next: ${VIEW_TITLE[nextStep]}`}
           rightIcon={IconNames.ARROW_RIGHT}
@@ -564,9 +642,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
             if (disabled) return;
             if (onNextStep) onNextStep();
 
-            setTimeout(() => {
-              this.updateStep(nextStep);
-            }, 10);
+            this.updateStep(nextStep);
           }}
         />
       </div>
@@ -630,13 +706,14 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
         <div className="main bp3-input">
           {this.renderIngestionCard('kafka')}
           {this.renderIngestionCard('kinesis')}
-          {this.renderIngestionCard('index:static-s3')}
-          {this.renderIngestionCard('index:static-google-blobstore')}
-          {this.renderIngestionCard('hadoop')}
-          {this.renderIngestionCard('index:ingestSegment')}
-          {this.renderIngestionCard('index:http')}
-          {this.renderIngestionCard('index:local')}
-          {this.renderIngestionCard('index:inline')}
+          {this.renderIngestionCard('index_parallel:s3')}
+          {this.renderIngestionCard('index_parallel:azure')}
+          {this.renderIngestionCard('index_parallel:google')}
+          {this.renderIngestionCard('index_parallel:hdfs')}
+          {this.renderIngestionCard('index_parallel:druid')}
+          {this.renderIngestionCard('index_parallel:http')}
+          {this.renderIngestionCard('index_parallel:local')}
+          {this.renderIngestionCard('index_parallel:inline')}
           {exampleManifestsUrl && this.renderIngestionCard('example', noExamples)}
           {this.renderIngestionCard('other')}
         </div>
@@ -662,18 +739,18 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
     if (issue) return issue;
 
     switch (selectedComboType) {
-      case 'index:http':
+      case 'index_parallel:http':
         return (
           <>
             <p>Load data accessible through HTTP(s).</p>
             <p>
-              Data must be in a text format and the HTTP(s) endpoint must be reachable by every
-              Druid process in the cluster.
+              Data must be in text, orc, or parquet format and the HTTP(s) endpoint must be
+              reachable by every Druid process in the cluster.
             </p>
           </>
         );
 
-      case 'index:local':
+      case 'index_parallel:local':
         return (
           <>
             <p>
@@ -681,13 +758,13 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
             </p>
             <p>Load data directly from a local file.</p>
             <p>
-              Files must be in a text format and must be accessible to all the Druid processes in
-              the cluster.
+              Files must be in text, orc, or parquet format and must be accessible to all the Druid
+              processes in the cluster.
             </p>
           </>
         );
 
-      case 'index:ingestSegment':
+      case 'index_parallel:druid':
         return (
           <>
             <p>Reindex data from existing Druid segments.</p>
@@ -698,44 +775,30 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
           </>
         );
 
-      case 'index:inline':
+      case 'index_parallel:inline':
         return (
           <>
             <p>Ingest a small amount of data directly from the clipboard.</p>
           </>
         );
 
-      case 'index:static-s3':
-        return <p>Load text based data from Amazon S3.</p>;
+      case 'index_parallel:s3':
+        return <p>Load text based, orc, or parquet data from Amazon S3.</p>;
 
-      case 'index:static-google-blobstore':
-        return <p>Load text based data from the Google Blobstore.</p>;
+      case 'index_parallel:azure':
+        return <p>Load text based, orc, or parquet data from Azure.</p>;
+
+      case 'index_parallel:google':
+        return <p>Load text based, orc, or parquet data from the Google Blobstore.</p>;
+
+      case 'index_parallel:hdfs':
+        return <p>Load text based, orc, or parquet data from HDFS.</p>;
 
       case 'kafka':
         return <p>Load streaming data in real-time from Apache Kafka.</p>;
 
       case 'kinesis':
         return <p>Load streaming data in real-time from Amazon Kinesis.</p>;
-
-      case 'hadoop':
-        return (
-          <>
-            <p>
-              <em>Data loader support coming soon!</em>
-            </p>
-            <p>
-              You can not ingest data from HDFS via the data loader at this time, however you can
-              ingest it through a Druid task.
-            </p>
-            <p>
-              Please follow{' '}
-              <ExternalLink href="https://druid.apache.org/docs/latest/ingestion/hadoop.html">
-                the hadoop docs
-              </ExternalLink>{' '}
-              and submit a JSON spec to start the task.
-            </p>
-          </>
-        );
 
       case 'example':
         if (exampleManifests && exampleManifests.length) {
@@ -748,7 +811,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
         return (
           <p>
             If you do not see your source of raw data here, you can try to ingest it by submitting a{' '}
-            <ExternalLink href="https://druid.apache.org/docs/latest/ingestion/index.html">
+            <ExternalLink href={`${getLink('DOCS')}/ingestion/index.html`}>
               JSON task or supervisor spec
             </ExternalLink>
             .
@@ -761,19 +824,21 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
   }
 
   renderWelcomeStepControls(): JSX.Element | undefined {
-    const { goToTask } = this.props;
+    const { goToIngestion } = this.props;
     const { spec, selectedComboType, exampleManifests } = this.state;
 
     const issue = this.selectedIngestionTypeIssue();
     if (issue) return;
 
     switch (selectedComboType) {
-      case 'index:http':
-      case 'index:local':
-      case 'index:ingestSegment':
-      case 'index:inline':
-      case 'index:static-s3':
-      case 'index:static-google-blobstore':
+      case 'index_parallel:http':
+      case 'index_parallel:local':
+      case 'index_parallel:druid':
+      case 'index_parallel:inline':
+      case 'index_parallel:s3':
+      case 'index_parallel:azure':
+      case 'index_parallel:google':
+      case 'index_parallel:hdfs':
       case 'kafka':
       case 'kinesis':
         return (
@@ -784,22 +849,8 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
               intent={Intent.PRIMARY}
               onClick={() => {
                 this.updateSpec(updateIngestionType(spec, selectedComboType as any));
-                setTimeout(() => {
-                  this.updateStep('connect');
-                }, 10);
+                this.updateStep('connect');
               }}
-            />
-          </FormGroup>
-        );
-
-      case 'hadoop':
-        return (
-          <FormGroup>
-            <Button
-              text="Submit task"
-              rightIcon={IconNames.ARROW_RIGHT}
-              intent={Intent.PRIMARY}
-              onClick={() => goToTask(undefined, 'task')}
             />
           </FormGroup>
         );
@@ -811,9 +862,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
             exampleManifests={exampleManifests}
             onSelectExample={exampleManifest => {
               this.updateSpec(exampleManifest.spec);
-              setTimeout(() => {
-                this.updateStep('connect');
-              }, 10);
+              this.updateStep('connect');
             }}
           />
         );
@@ -826,7 +875,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
                 text="Submit supervisor"
                 rightIcon={IconNames.ARROW_RIGHT}
                 intent={Intent.PRIMARY}
-                onClick={() => goToTask(undefined, 'supervisor')}
+                onClick={() => goToIngestion(undefined, 'supervisor')}
               />
             </FormGroup>
             <FormGroup>
@@ -834,7 +883,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
                 text="Submit task"
                 rightIcon={IconNames.ARROW_RIGHT}
                 intent={Intent.PRIMARY}
-                onClick={() => goToTask(undefined, 'task')}
+                onClick={() => goToIngestion(undefined, 'task')}
               />
             </FormGroup>
           </>
@@ -865,7 +914,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
         </p>
         <p>
           For more information please refer to the{' '}
-          <ExternalLink href="https://druid.apache.org/docs/latest/operations/including-extensions">
+          <ExternalLink href={`${getLink('DOCS')}/operations/including-extensions`}>
             documentation on loading extensions
           </ExternalLink>
           .
@@ -911,10 +960,10 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
 
   async queryForConnect(initRun = false) {
     const { spec, sampleStrategy } = this.state;
-    const ioConfig: IoConfig = deepGet(spec, 'ioConfig') || EMPTY_OBJECT;
+    const ioConfig: IoConfig = deepGet(spec, 'spec.ioConfig') || EMPTY_OBJECT;
 
     let issue: string | undefined;
-    if (issueWithIoConfig(ioConfig)) {
+    if (issueWithIoConfig(ioConfig, true)) {
       issue = `IoConfig not ready, ${issueWithIoConfig(ioConfig)}`;
     }
 
@@ -939,18 +988,21 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
       return;
     }
 
-    this.setState({
-      cacheKey: sampleResponse.cacheKey,
+    const deltaState: Partial<LoadDataViewState> = {
       inputQueryState: new QueryState({ data: sampleResponse }),
-    });
+    };
+    if (isDruidSource(spec)) {
+      deltaState.cacheRows = getCacheRowsFromSampleResponse(sampleResponse, true);
+    }
+    this.setState(deltaState as LoadDataViewState);
   }
 
   renderConnectStep() {
-    const { spec, inputQueryState, sampleStrategy } = this.state;
+    const { specPreview: spec, inputQueryState, sampleStrategy } = this.state;
     const specType = getSpecType(spec);
-    const ioConfig: IoConfig = deepGet(spec, 'ioConfig') || EMPTY_OBJECT;
-    const isBlank = !ioConfig.type;
-    const inlineMode = deepGet(spec, 'ioConfig.firehose.type') === 'inline';
+    const ioConfig: IoConfig = deepGet(spec, 'spec.ioConfig') || EMPTY_OBJECT;
+    const inlineMode = deepGet(spec, 'spec.ioConfig.inputSource.type') === 'inline';
+    const druidSource = isDruidSource(spec);
 
     let mainFill: JSX.Element | string = '';
     if (inlineMode) {
@@ -958,10 +1010,10 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
         <TextArea
           className="inline-data"
           placeholder="Paste your data here"
-          value={deepGet(spec, 'ioConfig.firehose.data')}
+          value={deepGet(spec, 'spec.ioConfig.inputSource.data')}
           onChange={(e: any) => {
             const stringValue = e.target.value.substr(0, MAX_INLINE_DATA_LENGTH);
-            this.updateSpec(deepSet(spec, 'ioConfig.firehose.data', stringValue));
+            this.updateSpecPreview(deepSet(spec, 'spec.ioConfig.inputSource.data', stringValue));
           }}
         />
       );
@@ -981,15 +1033,17 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
       mainFill = (
         <TextArea
           className="raw-lines"
+          readOnly
           value={
             inputData.length
-              ? (inputData.every(l => !l.raw)
+              ? (inputData.every(l => !l.parsed)
                   ? inputData.map(showBlankLine)
+                  : druidSource
+                  ? inputData.map(showDruidLine)
                   : inputData.map(showRawLine)
                 ).join('\n')
               : 'No data returned from sampler'
           }
-          readOnly
         />
       );
     }
@@ -1002,45 +1056,51 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
           <Callout className="intro">
             <p>
               Druid ingests raw data and converts it into a custom,{' '}
-              <ExternalLink href="https://druid.apache.org/docs/latest/design/segments.html">
-                indexed
+              <ExternalLink href={`${getLink('DOCS')}/design/segments.html`}>
+                indexed format
               </ExternalLink>{' '}
-              format that is optimized for analytic queries.
+              that is optimized for analytic queries.
             </p>
             {inlineMode ? (
               <>
                 <p>To get started, please paste some data in the box to the left.</p>
-                <p>Click "Register" to verify your data with Druid.</p>
+                <p>Click "Apply" to verify your data with Druid.</p>
               </>
             ) : (
-              <>
-                <p>
-                  To get started, please specify where your raw data is stored and what data you
-                  want to ingest.
-                </p>
-                <p>Click "Preview" to look at the sampled raw data.</p>
-              </>
+              <p>To get started, please specify what data you want to ingest.</p>
             )}
+            <LearnMore href={getIngestionDocLink(spec)} />
           </Callout>
           {ingestionComboType ? (
-            <AutoForm
-              fields={getIoConfigFormFields(ingestionComboType)}
-              model={ioConfig}
-              onChange={c => this.updateSpec(deepSet(spec, 'ioConfig', c))}
-            />
+            <>
+              <AutoForm
+                fields={getIoConfigFormFields(ingestionComboType)}
+                model={ioConfig}
+                onChange={c => this.updateSpecPreview(deepSet(spec, 'spec.ioConfig', c))}
+              />
+              {deepGet(spec, 'spec.ioConfig.inputSource.properties.secretAccessKey.password') && (
+                <FormGroup>
+                  <Callout intent={Intent.WARNING}>
+                    This key will be visible to anyone accessing this console and may appear in
+                    server logs. For production scenarios, use of a more secure secret key type is
+                    strongly recommended.
+                  </Callout>
+                </FormGroup>
+              )}
+            </>
           ) : (
             <FormGroup label="IO Config">
               <JsonInput
                 value={ioConfig}
-                onChange={c => this.updateSpec(deepSet(spec, 'ioConfig', c))}
+                onChange={c => this.updateSpecPreview(deepSet(spec, 'spec.ioConfig', c))}
                 height="300px"
               />
             </FormGroup>
           )}
-          {deepGet(spec, 'ioConfig.firehose.type') === 'local' && (
+          {deepGet(spec, 'spec.ioConfig.inputSource.type') === 'local' && (
             <FormGroup>
               <Callout intent={Intent.WARNING}>
-                This path must be available on the local filesystem of all Druid servers.
+                This path must be available on the local filesystem of all Druid services.
               </Callout>
             </FormGroup>
           )}
@@ -1055,38 +1115,33 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
               </HTMLSelect>
             </FormGroup>
           )}
-          <Button
-            text={inlineMode ? 'Register data' : 'Preview'}
-            disabled={isBlank}
-            intent={inputQueryState.data ? undefined : Intent.PRIMARY}
-            onClick={() => this.queryForConnect()}
-          />
+          {this.renderApplyButtonBar()}
         </div>
         {this.renderNextBar({
           disabled: !inputQueryState.data,
+          nextStep: druidSource ? 'transform' : 'parser',
           onNextStep: () => {
             if (!inputQueryState.data) return;
             const inputData = inputQueryState.data;
 
-            if (isIngestSegment(spec)) {
-              let newSpec = fillParser(spec, []);
+            if (druidSource) {
+              let newSpec = deepSet(spec, 'spec.dataSchema.timestampSpec', {
+                column: '__time',
+                format: 'iso',
+              });
 
               if (typeof inputData.rollup === 'boolean') {
-                newSpec = deepSet(newSpec, 'dataSchema.granularitySpec.rollup', inputData.rollup);
-              }
-
-              if (inputData.timestampSpec) {
                 newSpec = deepSet(
                   newSpec,
-                  'dataSchema.parser.parseSpec.timestampSpec',
-                  inputData.timestampSpec,
+                  'spec.dataSchema.granularitySpec.rollup',
+                  inputData.rollup,
                 );
               }
 
               if (inputData.queryGranularity) {
                 newSpec = deepSet(
                   newSpec,
-                  'dataSchema.granularitySpec.queryGranularity',
+                  'spec.dataSchema.granularitySpec.queryGranularity',
                   inputData.queryGranularity,
                 );
               }
@@ -1095,7 +1150,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
                 const aggregators = inputData.aggregators || {};
                 newSpec = deepSet(
                   newSpec,
-                  'dataSchema.parser.parseSpec.dimensionsSpec.dimensions',
+                  'spec.dataSchema.dimensionsSpec.dimensions',
                   Object.keys(inputData.columns)
                     .filter(k => k !== '__time' && !aggregators[k])
                     .map(k => ({
@@ -1108,7 +1163,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
               if (inputData.aggregators) {
                 newSpec = deepSet(
                   newSpec,
-                  'dataSchema.metricsSpec',
+                  'spec.dataSchema.metricsSpec',
                   Object.values(inputData.aggregators),
                 );
               }
@@ -1117,7 +1172,12 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
             } else {
               this.updateSpec(
                 fillDataSourceNameIfNeeded(
-                  fillParser(spec, inputQueryState.data.data.map(l => l.raw)),
+                  fillInputFormat(
+                    spec,
+                    filterMap(inputQueryState.data.data, l =>
+                      l.parsed ? l.parsed.raw : undefined,
+                    ),
+                  ),
                 ),
               );
             }
@@ -1130,16 +1190,14 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
   // ==================================================================
 
   async queryForParser(initRun = false) {
-    const { spec, sampleStrategy, cacheKey } = this.state;
-    const ioConfig: IoConfig = deepGet(spec, 'ioConfig') || EMPTY_OBJECT;
-    const parser: Parser = deepGet(spec, 'dataSchema.parser') || EMPTY_OBJECT;
-    const parserColumns: string[] = deepGet(parser, 'parseSpec.columns') || [];
+    const { spec, sampleStrategy } = this.state;
+    const ioConfig: IoConfig = deepGet(spec, 'spec.ioConfig') || EMPTY_OBJECT;
+    const inputFormatColumns: string[] =
+      deepGet(spec, 'spec.ioConfig.inputFormat.columns') || EMPTY_ARRAY;
 
     let issue: string | undefined;
     if (issueWithIoConfig(ioConfig)) {
       issue = `IoConfig not ready, ${issueWithIoConfig(ioConfig)}`;
-    } else if (issueWithParser(parser)) {
-      issue = `Parser not ready, ${issueWithParser(parser)}`;
     }
 
     if (issue) {
@@ -1155,7 +1213,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
 
     let sampleResponse: SampleResponse;
     try {
-      sampleResponse = await sampleForParser(spec, sampleStrategy, cacheKey);
+      sampleResponse = await sampleForParser(spec, sampleStrategy);
     } catch (e) {
       this.setState({
         parserQueryState: new QueryState({ error: e.message }),
@@ -1164,27 +1222,26 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
     }
 
     this.setState({
-      cacheKey: sampleResponse.cacheKey,
+      cacheRows: getCacheRowsFromSampleResponse(sampleResponse),
       parserQueryState: new QueryState({
-        data: headerAndRowsFromSampleResponse(sampleResponse, '__time', parserColumns),
+        data: headerAndRowsFromSampleResponse(sampleResponse, '__time', inputFormatColumns),
       }),
     });
   }
 
   renderParserStep() {
     const {
-      spec,
+      specPreview: spec,
       columnFilter,
       specialColumnsOnly,
       parserQueryState,
       selectedFlattenField,
     } = this.state;
-    const parseSpec: ParseSpec = deepGet(spec, 'dataSchema.parser.parseSpec') || EMPTY_OBJECT;
+    const inputFormat: InputFormat = deepGet(spec, 'spec.ioConfig.inputFormat') || EMPTY_OBJECT;
     const flattenFields: FlattenField[] =
-      deepGet(spec, 'dataSchema.parser.parseSpec.flattenSpec.fields') || EMPTY_ARRAY;
+      deepGet(spec, 'spec.ioConfig.inputFormat.flattenSpec.fields') || EMPTY_ARRAY;
 
-    const isBlank = !parseSpec.format;
-    const canFlatten = parseSpec.format === 'json';
+    const canFlatten = inputFormatCanFlatten(inputFormat);
 
     let mainFill: JSX.Element | string = '';
     if (parserQueryState.isInit()) {
@@ -1227,10 +1284,10 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
       );
     }
 
-    let sugestedFlattenFields: FlattenField[] | null = null;
+    let sugestedFlattenFields: FlattenField[] | undefined;
     if (canFlatten && !flattenFields.length && parserQueryState.data) {
       sugestedFlattenFields = computeFlattenPathsForData(
-        filterMap(parserQueryState.data.rows, r => parseJson(r.raw)),
+        filterMap(parserQueryState.data.rows, r => r.input),
         'path',
         'ignore-arrays',
       );
@@ -1248,46 +1305,47 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
             {canFlatten && (
               <p>
                 If you have nested data, you can{' '}
-                <ExternalLink href="https://druid.apache.org/docs/latest/ingestion/flatten-json.html">
+                <ExternalLink href={`${getLink('DOCS')}/ingestion/index.html#flattenspec`}>
                   flatten
                 </ExternalLink>{' '}
                 it here. If the provided flattening capabilities are not sufficient, please
                 pre-process your data before ingesting it into Druid.
               </p>
             )}
-            <p>
-              Click "Preview" to ensure that your data appears correctly in a row/column
-              orientation.
-            </p>
+            <p>Ensure that your data appears correctly in a row/column orientation.</p>
+            <LearnMore href={`${getLink('DOCS')}/ingestion/data-formats.html`} />
           </Callout>
-          <AutoForm
-            fields={getParseSpecFormFields()}
-            model={parseSpec}
-            onChange={p => this.updateSpec(deepSet(spec, 'dataSchema.parser.parseSpec', p))}
-          />
+          {!selectedFlattenField && (
+            <>
+              <AutoForm
+                fields={getInputFormatFormFields()}
+                model={inputFormat}
+                onChange={p =>
+                  this.updateSpecPreview(deepSet(spec, 'spec.ioConfig.inputFormat', p))
+                }
+              />
+              {this.renderApplyButtonBar()}
+            </>
+          )}
           {this.renderFlattenControls()}
-          {Boolean(sugestedFlattenFields && sugestedFlattenFields.length) && (
+          {sugestedFlattenFields && sugestedFlattenFields.length ? (
             <FormGroup>
               <Button
                 icon={IconNames.LIGHTBULB}
-                text="Auto add flatten specs"
+                text={`Auto add ${pluralIfNeeded(sugestedFlattenFields.length, 'flatten spec')}`}
                 onClick={() => {
                   this.updateSpec(
                     deepSet(
                       spec,
-                      'dataSchema.parser.parseSpec.flattenSpec.fields',
+                      'spec.ioConfig.inputFormat.flattenSpec.fields',
                       sugestedFlattenFields,
                     ),
                   );
-                  setTimeout(() => {
-                    this.queryForParser();
-                  }, 10);
                 }}
               />
             </FormGroup>
-          )}
-          {!selectedFlattenField && (
-            <Button text="Preview" disabled={isBlank} onClick={() => this.queryForParser()} />
+          ) : (
+            undefined
           )}
         </div>
         {this.renderNextBar({
@@ -1295,7 +1353,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
           onNextStep: () => {
             if (!parserQueryState.data) return;
             let possibleTimestampSpec: TimestampSpec;
-            if (isIngestSegment(spec)) {
+            if (isDruidSource(spec)) {
               possibleTimestampSpec = {
                 column: '__time',
                 format: 'auto',
@@ -1307,7 +1365,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
             if (possibleTimestampSpec) {
               const newSpec: IngestionSpec = deepSet(
                 spec,
-                'dataSchema.parser.parseSpec.timestampSpec',
+                'spec.dataSchema.timestampSpec',
                 possibleTimestampSpec,
               );
               this.updateSpec(newSpec);
@@ -1327,21 +1385,14 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
 
   renderFlattenControls(): JSX.Element | undefined {
     const { spec, selectedFlattenField, selectedFlattenFieldIndex } = this.state;
-    const parseSpec: ParseSpec = deepGet(spec, 'dataSchema.parser.parseSpec') || EMPTY_OBJECT;
-    if (!parseSpecHasFlatten(parseSpec)) return;
+    const inputFormat: InputFormat = deepGet(spec, 'spec.ioConfig.inputFormat') || EMPTY_OBJECT;
+    if (!inputFormatCanFlatten(inputFormat)) return;
 
     const close = () => {
       this.setState({
         selectedFlattenFieldIndex: -1,
         selectedFlattenField: undefined,
       });
-    };
-
-    const closeAndQuery = () => {
-      close();
-      setTimeout(() => {
-        this.queryForParser();
-      }, 10);
     };
 
     if (selectedFlattenField) {
@@ -1352,38 +1403,38 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
             model={selectedFlattenField}
             onChange={f => this.setState({ selectedFlattenField: f })}
           />
-          <div className="controls-buttons">
+          <div className="control-buttons">
             <Button
-              className="add-update"
-              text={selectedFlattenFieldIndex === -1 ? 'Add' : 'Update'}
+              text="Apply"
               intent={Intent.PRIMARY}
               onClick={() => {
                 this.updateSpec(
                   deepSet(
                     spec,
-                    `dataSchema.parser.parseSpec.flattenSpec.fields.${selectedFlattenFieldIndex}`,
+                    `spec.ioConfig.inputFormat.flattenSpec.fields.${selectedFlattenFieldIndex}`,
                     selectedFlattenField,
                   ),
                 );
-                closeAndQuery();
+                close();
               }}
             />
+            <Button text="Cancel" onClick={close} />
             {selectedFlattenFieldIndex !== -1 && (
               <Button
+                className="right"
                 icon={IconNames.TRASH}
                 intent={Intent.DANGER}
                 onClick={() => {
                   this.updateSpec(
                     deepDelete(
                       spec,
-                      `dataSchema.parser.parseSpec.flattenSpec.fields.${selectedFlattenFieldIndex}`,
+                      `spec.ioConfig.inputFormat.flattenSpec.fields.${selectedFlattenFieldIndex}`,
                     ),
                   );
-                  closeAndQuery();
+                  close();
                 }}
               />
             )}
-            <Button className="cancel" text="Cancel" onClick={close} />
           </div>
         </div>
       );
@@ -1401,7 +1452,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
           />
           <AnchorButton
             icon={IconNames.INFO_SIGN}
-            href="https://druid.apache.org/docs/latest/ingestion/flatten-json.html"
+            href={`${getLink('DOCS')}/ingestion/flatten-json.html`}
             target="_blank"
             minimal
           />
@@ -1413,23 +1464,16 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
   // ==================================================================
 
   async queryForTimestamp(initRun = false) {
-    const { spec, sampleStrategy, cacheKey } = this.state;
-    const ioConfig: IoConfig = deepGet(spec, 'ioConfig') || EMPTY_OBJECT;
-    const parser: Parser = deepGet(spec, 'dataSchema.parser') || EMPTY_OBJECT;
-    const parserColumns: string[] = deepGet(parser, 'parseSpec.columns') || [];
-    const timestampSpec =
-      deepGet(spec, 'dataSchema.parser.parseSpec.timestampSpec') || EMPTY_OBJECT;
+    const { spec, cacheRows } = this.state;
+    const inputFormatColumns: string[] =
+      deepGet(spec, 'spec.ioConfig.inputFormat.columns') || EMPTY_ARRAY;
+    const timestampSpec = deepGet(spec, 'spec.dataSchema.timestampSpec') || EMPTY_OBJECT;
 
-    let issue: string | undefined;
-    if (issueWithIoConfig(ioConfig)) {
-      issue = `IoConfig not ready, ${issueWithIoConfig(ioConfig)}`;
-    } else if (issueWithParser(parser)) {
-      issue = `Parser not ready, ${issueWithParser(parser)}`;
-    }
-
-    if (issue) {
+    if (!cacheRows) {
       this.setState({
-        timestampQueryState: initRun ? QueryState.INIT : new QueryState({ error: issue }),
+        timestampQueryState: initRun
+          ? QueryState.INIT
+          : new QueryState({ error: 'must complete parse step' }),
       });
       return;
     }
@@ -1440,7 +1484,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
 
     let sampleResponse: SampleResponse;
     try {
-      sampleResponse = await sampleForTimestamp(spec, sampleStrategy, cacheKey);
+      sampleResponse = await sampleForTimestamp(spec, cacheRows);
     } catch (e) {
       this.setState({
         timestampQueryState: new QueryState({ error: e.message }),
@@ -1449,13 +1493,12 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
     }
 
     this.setState({
-      cacheKey: sampleResponse.cacheKey,
       timestampQueryState: new QueryState({
         data: {
           headerAndRows: headerAndRowsFromSampleResponse(
             sampleResponse,
             undefined,
-            ['__time'].concat(parserColumns),
+            ['__time'].concat(inputFormatColumns),
           ),
           timestampSpec,
         },
@@ -1464,13 +1507,10 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
   }
 
   renderTimestampStep() {
-    const { spec, columnFilter, specialColumnsOnly, timestampQueryState } = this.state;
-    const parseSpec: ParseSpec = deepGet(spec, 'dataSchema.parser.parseSpec') || EMPTY_OBJECT;
+    const { specPreview: spec, columnFilter, specialColumnsOnly, timestampQueryState } = this.state;
     const timestampSpec: TimestampSpec =
-      deepGet(spec, 'dataSchema.parser.parseSpec.timestampSpec') || EMPTY_OBJECT;
+      deepGet(spec, 'spec.dataSchema.timestampSpec') || EMPTY_OBJECT;
     const timestampSpecFromColumn = isColumnTimestampSpec(timestampSpec);
-
-    const isBlank = !parseSpec.format;
 
     let mainFill: JSX.Element | string = '';
     if (timestampQueryState.isInit()) {
@@ -1503,6 +1543,10 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
             sampleBundle={timestampQueryState.data}
             columnFilter={columnFilter}
             possibleTimestampColumnsOnly={specialColumnsOnly}
+            selectedColumnName={parseTimeTableSelectedColumnName(
+              timestampQueryState.data.headerAndRows,
+              timestampSpec,
+            )}
             onTimestampColumnSelect={this.onTimestampColumnSelect}
           />
         </div>
@@ -1517,10 +1561,10 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
             <p>
               Druid partitions data based on the primary time column of your data. This column is
               stored internally in Druid as <Code>__time</Code>. Please specify the primary time
-              column. If you do not have any time columns, you can choose "Constant Value" to create
+              column. If you do not have any time columns, you can choose "Constant value" to create
               a default one.
             </p>
-            <p>Click "Preview" to check if Druid can properly parse your time values.</p>
+            <LearnMore href={`${getLink('DOCS')}/ingestion/index.html#timestampspec`} />
           </Callout>
           <FormGroup label="Timestamp spec">
             <ButtonGroup>
@@ -1532,28 +1576,18 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
                     column: 'timestamp',
                     format: 'auto',
                   };
-                  this.updateSpec(
-                    deepSet(spec, 'dataSchema.parser.parseSpec.timestampSpec', timestampSpec),
+                  this.updateSpecPreview(
+                    deepSet(spec, 'spec.dataSchema.timestampSpec', timestampSpec),
                   );
-                  setTimeout(() => {
-                    this.queryForTimestamp();
-                  }, 10);
                 }}
               />
               <Button
                 text="Constant value"
                 active={!timestampSpecFromColumn}
                 onClick={() => {
-                  this.updateSpec(
-                    deepSet(
-                      spec,
-                      'dataSchema.parser.parseSpec.timestampSpec',
-                      getEmptyTimestampSpec(),
-                    ),
+                  this.updateSpecPreview(
+                    deepSet(spec, 'spec.dataSchema.timestampSpec', getConstantTimestampSpec()),
                   );
-                  setTimeout(() => {
-                    this.queryForTimestamp();
-                  }, 10);
                 }}
               />
             </ButtonGroup>
@@ -1562,12 +1596,10 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
             fields={getTimestampSpecFormFields(timestampSpec)}
             model={timestampSpec}
             onChange={timestampSpec => {
-              this.updateSpec(
-                deepSet(spec, 'dataSchema.parser.parseSpec.timestampSpec', timestampSpec),
-              );
+              this.updateSpecPreview(deepSet(spec, 'spec.dataSchema.timestampSpec', timestampSpec));
             }}
           />
-          <Button text="Preview" disabled={isBlank} onClick={() => this.queryForTimestamp()} />
+          {this.renderApplyButtonBar()}
         </div>
         {this.renderNextBar({
           disabled: !timestampQueryState.data,
@@ -1577,28 +1609,22 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
   }
 
   private onTimestampColumnSelect = (newTimestampSpec: TimestampSpec) => {
-    const { spec } = this.state;
-    this.updateSpec(deepSet(spec, 'dataSchema.parser.parseSpec.timestampSpec', newTimestampSpec));
+    const { specPreview } = this.state;
+    this.updateSpecPreview(deepSet(specPreview, 'spec.dataSchema.timestampSpec', newTimestampSpec));
   };
 
   // ==================================================================
 
   async queryForTransform(initRun = false) {
-    const { spec, sampleStrategy, cacheKey } = this.state;
-    const ioConfig: IoConfig = deepGet(spec, 'ioConfig') || EMPTY_OBJECT;
-    const parser: Parser = deepGet(spec, 'dataSchema.parser') || EMPTY_OBJECT;
-    const parserColumns: string[] = deepGet(parser, 'parseSpec.columns') || [];
+    const { spec, cacheRows } = this.state;
+    const inputFormatColumns: string[] =
+      deepGet(spec, 'spec.ioConfig.inputFormat.columns') || EMPTY_ARRAY;
 
-    let issue: string | undefined;
-    if (issueWithIoConfig(ioConfig)) {
-      issue = `IoConfig not ready, ${issueWithIoConfig(ioConfig)}`;
-    } else if (issueWithParser(parser)) {
-      issue = `Parser not ready, ${issueWithParser(parser)}`;
-    }
-
-    if (issue) {
+    if (!cacheRows) {
       this.setState({
-        transformQueryState: initRun ? QueryState.INIT : new QueryState({ error: issue }),
+        transformQueryState: initRun
+          ? QueryState.INIT
+          : new QueryState({ error: 'must complete parse step' }),
       });
       return;
     }
@@ -1609,7 +1635,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
 
     let sampleResponse: SampleResponse;
     try {
-      sampleResponse = await sampleForTransform(spec, sampleStrategy, cacheKey);
+      sampleResponse = await sampleForTransform(spec, cacheRows);
     } catch (e) {
       this.setState({
         transformQueryState: new QueryState({ error: e.message }),
@@ -1618,12 +1644,11 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
     }
 
     this.setState({
-      cacheKey: sampleResponse.cacheKey,
       transformQueryState: new QueryState({
         data: headerAndRowsFromSampleResponse(
           sampleResponse,
           undefined,
-          ['__time'].concat(parserColumns),
+          ['__time'].concat(inputFormatColumns),
         ),
       }),
     });
@@ -1635,10 +1660,11 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
       columnFilter,
       specialColumnsOnly,
       transformQueryState,
-      selectedTransformIndex,
+      selectedTransform,
+      // selectedTransformIndex,
     } = this.state;
     const transforms: Transform[] =
-      deepGet(spec, 'dataSchema.transformSpec.transforms') || EMPTY_ARRAY;
+      deepGet(spec, 'spec.dataSchema.transformSpec.transforms') || EMPTY_ARRAY;
 
     let mainFill: JSX.Element | string = '';
     if (transformQueryState.isInit()) {
@@ -1668,7 +1694,10 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
             columnFilter={columnFilter}
             transformedColumnsOnly={specialColumnsOnly}
             transforms={transforms}
-            selectedTransformIndex={selectedTransformIndex}
+            selectedColumnName={transformTableSelectedColumnName(
+              transformQueryState.data,
+              selectedTransform,
+            )}
             onTransformSelect={this.onTransformSelect}
           />
         </div>
@@ -1682,13 +1711,13 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
           <Callout className="intro">
             <p className="optional">Optional</p>
             <p>
-              Druid can perform simple{' '}
-              <ExternalLink href="https://druid.apache.org/docs/latest/ingestion/transform-spec.html#transforms">
+              Druid can perform per-row{' '}
+              <ExternalLink href={`${getLink('DOCS')}/ingestion/transform-spec.html#transforms`}>
                 transforms
               </ExternalLink>{' '}
-              of column values.
+              of column values allowing you to create new derived columns or alter existing column.
             </p>
-            <p>Click "Preview" to see the result of any specified transforms.</p>
+            <LearnMore href={`${getLink('DOCS')}/ingestion/index.html#transforms`} />
           </Callout>
           {Boolean(transformQueryState.error && transforms.length) && (
             <FormGroup>
@@ -1706,13 +1735,12 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
             </FormGroup>
           )}
           {this.renderTransformControls()}
-          <Button text="Preview" onClick={() => this.queryForTransform()} />
         </div>
         {this.renderNextBar({
           disabled: !transformQueryState.data,
           onNextStep: () => {
             if (!transformQueryState.data) return;
-            if (!isIngestSegment(spec)) {
+            if (!isDruidSource(spec)) {
               this.updateSpec(
                 updateSchemaWithSample(spec, transformQueryState.data, 'specific', true),
               );
@@ -1740,13 +1768,6 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
       });
     };
 
-    const closeAndQuery = () => {
-      close();
-      setTimeout(() => {
-        this.queryForTransform();
-      }, 10);
-    };
-
     if (selectedTransform) {
       return (
         <div className="edit-controls">
@@ -1755,38 +1776,38 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
             model={selectedTransform}
             onChange={selectedTransform => this.setState({ selectedTransform })}
           />
-          <div className="controls-buttons">
+          <div className="control-buttons">
             <Button
-              className="add-update"
-              text={selectedTransformIndex === -1 ? 'Add' : 'Update'}
+              text="Apply"
               intent={Intent.PRIMARY}
               onClick={() => {
                 this.updateSpec(
                   deepSet(
                     spec,
-                    `dataSchema.transformSpec.transforms.${selectedTransformIndex}`,
+                    `spec.dataSchema.transformSpec.transforms.${selectedTransformIndex}`,
                     selectedTransform,
                   ),
                 );
-                closeAndQuery();
+                close();
               }}
             />
+            <Button text="Cancel" onClick={close} />
             {selectedTransformIndex !== -1 && (
               <Button
+                className="right"
                 icon={IconNames.TRASH}
                 intent={Intent.DANGER}
                 onClick={() => {
                   this.updateSpec(
                     deepDelete(
                       spec,
-                      `dataSchema.transformSpec.transforms.${selectedTransformIndex}`,
+                      `spec.dataSchema.transformSpec.transforms.${selectedTransformIndex}`,
                     ),
                   );
-                  closeAndQuery();
+                  close();
                 }}
               />
             )}
-            <Button className="cancel" text="Cancel" onClick={close} />
           </div>
         </div>
       );
@@ -1810,21 +1831,15 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
   // ==================================================================
 
   async queryForFilter(initRun = false) {
-    const { spec, sampleStrategy, cacheKey } = this.state;
-    const ioConfig: IoConfig = deepGet(spec, 'ioConfig') || EMPTY_OBJECT;
-    const parser: Parser = deepGet(spec, 'dataSchema.parser') || EMPTY_OBJECT;
-    const parserColumns: string[] = deepGet(parser, 'parseSpec.columns') || [];
+    const { spec, cacheRows } = this.state;
+    const inputFormatColumns: string[] =
+      deepGet(spec, 'spec.ioConfig.inputFormat.columns') || EMPTY_ARRAY;
 
-    let issue: string | undefined;
-    if (issueWithIoConfig(ioConfig)) {
-      issue = `IoConfig not ready, ${issueWithIoConfig(ioConfig)}`;
-    } else if (issueWithParser(parser)) {
-      issue = `Parser not ready, ${issueWithParser(parser)}`;
-    }
-
-    if (issue) {
+    if (!cacheRows) {
       this.setState({
-        filterQueryState: initRun ? QueryState.INIT : new QueryState({ error: issue }),
+        filterQueryState: initRun
+          ? QueryState.INIT
+          : new QueryState({ error: 'must complete parse step' }),
       });
       return;
     }
@@ -1835,7 +1850,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
 
     let sampleResponse: SampleResponse;
     try {
-      sampleResponse = await sampleForFilter(spec, sampleStrategy, cacheKey);
+      sampleResponse = await sampleForFilter(spec, cacheRows);
     } catch (e) {
       this.setState({
         filterQueryState: new QueryState({ error: e.message }),
@@ -1845,12 +1860,11 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
 
     if (sampleResponse.data.length) {
       this.setState({
-        cacheKey: sampleResponse.cacheKey,
         filterQueryState: new QueryState({
           data: headerAndRowsFromSampleResponse(
             sampleResponse,
             undefined,
-            ['__time'].concat(parserColumns),
+            ['__time'].concat(inputFormatColumns),
             true,
           ),
         }),
@@ -1861,8 +1875,8 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
     // The filters matched no data
     let sampleResponseNoFilter: SampleResponse;
     try {
-      const specNoFilter = deepSet(spec, 'dataSchema.transformSpec.filter', null);
-      sampleResponseNoFilter = await sampleForFilter(specNoFilter, sampleStrategy, cacheKey);
+      const specNoFilter = deepSet(spec, 'spec.dataSchema.transformSpec.filter', null);
+      sampleResponseNoFilter = await sampleForFilter(specNoFilter, cacheRows);
     } catch (e) {
       this.setState({
         filterQueryState: new QueryState({ error: e.message }),
@@ -1873,12 +1887,12 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
     const headerAndRowsNoFilter = headerAndRowsFromSampleResponse(
       sampleResponseNoFilter,
       undefined,
-      ['__time'].concat(parserColumns),
+      ['__time'].concat(inputFormatColumns),
       true,
     );
 
     this.setState({
-      cacheKey: sampleResponseNoFilter.cacheKey,
+      // cacheRows: sampleResponseNoFilter.cacheKey,
       filterQueryState: new QueryState({
         data: deepSet(headerAndRowsNoFilter, 'rows', []),
       }),
@@ -1886,23 +1900,13 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
   }
 
   private getMemoizedDimensionFiltersFromSpec = memoize(spec => {
-    const { dimensionFilters } = splitFilter(deepGet(spec, 'dataSchema.transformSpec.filter'));
+    const { dimensionFilters } = splitFilter(deepGet(spec, 'spec.dataSchema.transformSpec.filter'));
     return dimensionFilters;
   });
 
   renderFilterStep() {
-    const {
-      spec,
-      columnFilter,
-      filterQueryState,
-      selectedFilter,
-      selectedFilterIndex,
-      showGlobalFilter,
-    } = this.state;
-    const parseSpec: ParseSpec = deepGet(spec, 'dataSchema.parser.parseSpec') || EMPTY_OBJECT;
+    const { spec, columnFilter, filterQueryState, selectedFilter, showGlobalFilter } = this.state;
     const dimensionFilters = this.getMemoizedDimensionFiltersFromSpec(spec);
-
-    const isBlank = !parseSpec.format;
 
     let mainFill: JSX.Element | string = '';
     if (filterQueryState.isInit()) {
@@ -1925,7 +1929,10 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
             sampleData={filterQueryState.data}
             columnFilter={columnFilter}
             dimensionFilters={dimensionFilters}
-            selectedFilterIndex={selectedFilterIndex}
+            selectedFilterName={filterTableSelectedColumnName(
+              filterQueryState.data,
+              selectedFilter,
+            )}
             onShowGlobalFilter={this.onShowGlobalFilter}
             onFilterSelect={this.onFilterSelect}
           />
@@ -1941,18 +1948,13 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
             <p className="optional">Optional</p>
             <p>
               Druid can{' '}
-              <ExternalLink href="https://druid.apache.org/docs/latest/querying/filters.html">
-                filter
-              </ExternalLink>{' '}
-              out unwanted data.
+              <ExternalLink href={`${getLink('DOCS')}/querying/filters.html`}>filter</ExternalLink>{' '}
+              out unwanted data by applying per-row filters.
             </p>
-            <p>Click "Preview" to see the impact of any specified filters.</p>
+            <LearnMore href={`${getLink('DOCS')}/ingestion/index.html#filter`} />
           </Callout>
           {!showGlobalFilter && this.renderColumnFilterControls()}
           {!selectedFilter && this.renderGlobalFilterControls()}
-          {!selectedFilter && !showGlobalFilter && (
-            <Button text="Preview" disabled={isBlank} onClick={() => this.queryForFilter()} />
-          )}
         </div>
         {this.renderNextBar({})}
       </>
@@ -1980,13 +1982,6 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
       });
     };
 
-    const closeAndQuery = () => {
-      close();
-      setTimeout(() => {
-        this.queryForFilter();
-      }, 10);
-    };
-
     if (selectedFilter) {
       return (
         <div className="edit-controls">
@@ -1996,35 +1991,39 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
             onChange={f => this.setState({ selectedFilter: f })}
             showCustom={f => !['selector', 'in', 'regex', 'like', 'not'].includes(f.type)}
           />
-          <div className="controls-buttons">
+          <div className="control-buttons">
             <Button
-              className="add-update"
-              text={selectedFilterIndex === -1 ? 'Add' : 'Update'}
+              text="Apply"
               intent={Intent.PRIMARY}
               onClick={() => {
-                const curFilter = splitFilter(deepGet(spec, 'dataSchema.transformSpec.filter'));
+                const curFilter = splitFilter(
+                  deepGet(spec, 'spec.dataSchema.transformSpec.filter'),
+                );
                 const newFilter = joinFilter(
                   deepSet(curFilter, `dimensionFilters.${selectedFilterIndex}`, selectedFilter),
                 );
-                this.updateSpec(deepSet(spec, 'dataSchema.transformSpec.filter', newFilter));
-                closeAndQuery();
+                this.updateSpec(deepSet(spec, 'spec.dataSchema.transformSpec.filter', newFilter));
+                close();
               }}
             />
+            <Button text="Cancel" onClick={close} />
             {selectedFilterIndex !== -1 && (
               <Button
+                className="right"
                 icon={IconNames.TRASH}
                 intent={Intent.DANGER}
                 onClick={() => {
-                  const curFilter = splitFilter(deepGet(spec, 'dataSchema.transformSpec.filter'));
+                  const curFilter = splitFilter(
+                    deepGet(spec, 'spec.dataSchema.transformSpec.filter'),
+                  );
                   const newFilter = joinFilter(
                     deepDelete(curFilter, `dimensionFilters.${selectedFilterIndex}`),
                   );
-                  this.updateSpec(deepSet(spec, 'dataSchema.transformSpec.filter', newFilter));
-                  closeAndQuery();
+                  this.updateSpec(deepSet(spec, 'spec.dataSchema.transformSpec.filter', newFilter));
+                  close();
                 }}
               />
             )}
-            <Button className="cancel" text="Cancel" onClick={close} />
           </div>
         </div>
       );
@@ -2046,9 +2045,9 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
   }
 
   renderGlobalFilterControls() {
-    const { spec, showGlobalFilter } = this.state;
-    const intervals: string[] = deepGet(spec, 'dataSchema.granularitySpec.intervals');
-    const { restFilter } = splitFilter(deepGet(spec, 'dataSchema.transformSpec.filter'));
+    const { spec, showGlobalFilter, newFilterValue } = this.state;
+    const intervals: string[] = deepGet(spec, 'spec.dataSchema.granularitySpec.intervals');
+    const { restFilter } = splitFilter(deepGet(spec, 'spec.dataSchema.transformSpec.filter'));
     const hasGlobalFilter = Boolean(intervals || restFilter);
 
     if (showGlobalFilter) {
@@ -2057,7 +2056,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
           <AutoForm
             fields={[
               {
-                name: 'dataSchema.granularitySpec.intervals',
+                name: 'spec.dataSchema.granularitySpec.intervals',
                 label: 'Time intervals',
                 type: 'string-array',
                 placeholder: 'ex: 2018-01-01/2018-06-01',
@@ -2074,27 +2073,25 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
           />
           <FormGroup label="Extra filter">
             <JsonInput
-              value={restFilter}
-              onChange={f => {
-                const curFilter = splitFilter(deepGet(spec, 'dataSchema.transformSpec.filter'));
-                const newFilter = joinFilter(deepSet(curFilter, `restFilter`, f));
-                this.updateSpec(deepSet(spec, 'dataSchema.transformSpec.filter', newFilter));
-              }}
+              value={newFilterValue}
+              onChange={f => this.setState({ newFilterValue: f })}
               height="200px"
             />
           </FormGroup>
-          <div className="controls-buttons">
+          <div className="control-buttons">
             <Button
-              className="add-update"
-              text="Preview"
+              text="Apply"
               intent={Intent.PRIMARY}
-              onClick={() => this.queryForFilter()}
+              onClick={() => {
+                const curFilter = splitFilter(
+                  deepGet(spec, 'spec.dataSchema.transformSpec.filter'),
+                );
+                const newFilter = joinFilter(deepSet(curFilter, `restFilter`, newFilterValue));
+                this.updateSpec(deepSet(spec, 'spec.dataSchema.transformSpec.filter', newFilter));
+                this.setState({ showGlobalFilter: false, newFilterValue: undefined });
+              }}
             />
-            <Button
-              className="cancel"
-              text="Close"
-              onClick={() => this.setState({ showGlobalFilter: false })}
-            />
+            <Button text="Cancel" onClick={() => this.setState({ showGlobalFilter: false })} />
           </div>
         </div>
       );
@@ -2103,7 +2100,12 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
         <FormGroup>
           <Button
             text={`${hasGlobalFilter ? 'Edit' : 'Add'} global filter`}
-            onClick={() => this.setState({ showGlobalFilter: true })}
+            onClick={() =>
+              this.setState({
+                showGlobalFilter: true,
+                newFilterValue: restFilter,
+              })
+            }
           />
         </FormGroup>
       );
@@ -2113,24 +2115,18 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
   // ==================================================================
 
   async queryForSchema(initRun = false) {
-    const { spec, sampleStrategy, cacheKey } = this.state;
-    const ioConfig: IoConfig = deepGet(spec, 'ioConfig') || EMPTY_OBJECT;
-    const parser: Parser = deepGet(spec, 'dataSchema.parser') || EMPTY_OBJECT;
-    const parserColumns: string[] = deepGet(parser, 'parseSpec.columns') || [];
-    const metricsSpec: MetricSpec[] = deepGet(spec, 'dataSchema.metricsSpec') || EMPTY_ARRAY;
+    const { spec, cacheRows } = this.state;
+    const inputFormatColumns: string[] =
+      deepGet(spec, 'spec.ioConfig.inputFormat.columns') || EMPTY_ARRAY;
+    const metricsSpec: MetricSpec[] = deepGet(spec, 'spec.dataSchema.metricsSpec') || EMPTY_ARRAY;
     const dimensionsSpec: DimensionsSpec =
-      deepGet(spec, 'dataSchema.parser.parseSpec.dimensionsSpec') || EMPTY_OBJECT;
+      deepGet(spec, 'spec.dataSchema.dimensionsSpec') || EMPTY_OBJECT;
 
-    let issue: string | undefined;
-    if (issueWithIoConfig(ioConfig)) {
-      issue = `IoConfig not ready, ${issueWithIoConfig(ioConfig)}`;
-    } else if (issueWithParser(parser)) {
-      issue = `Parser not ready, ${issueWithParser(parser)}`;
-    }
-
-    if (issue) {
+    if (!cacheRows) {
       this.setState({
-        schemaQueryState: initRun ? QueryState.INIT : new QueryState({ error: issue }),
+        schemaQueryState: initRun
+          ? QueryState.INIT
+          : new QueryState({ error: 'must complete parse step' }),
       });
       return;
     }
@@ -2141,7 +2137,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
 
     let sampleResponse: SampleResponse;
     try {
-      sampleResponse = await sampleForSchema(spec, sampleStrategy, cacheKey);
+      sampleResponse = await sampleForSchema(spec, cacheRows);
     } catch (e) {
       this.setState({
         schemaQueryState: new QueryState({ error: e.message }),
@@ -2150,13 +2146,12 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
     }
 
     this.setState({
-      cacheKey: sampleResponse.cacheKey,
       schemaQueryState: new QueryState({
         data: {
           headerAndRows: headerAndRowsFromSampleResponse(
             sampleResponse,
             undefined,
-            ['__time'].concat(parserColumns),
+            ['__time'].concat(inputFormatColumns),
           ),
           dimensionsSpec,
           metricsSpec,
@@ -2167,7 +2162,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
 
   renderSchemaStep() {
     const {
-      spec,
+      specPreview: spec,
       columnFilter,
       schemaQueryState,
       selectedDimensionSpec,
@@ -2175,7 +2170,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
       selectedMetricSpec,
       selectedMetricSpecIndex,
     } = this.state;
-    const rollup: boolean = Boolean(deepGet(spec, 'dataSchema.granularitySpec.rollup'));
+    const rollup: boolean = Boolean(deepGet(spec, 'spec.dataSchema.granularitySpec.rollup'));
     const somethingSelected = Boolean(selectedDimensionSpec || selectedMetricSpec);
     const dimensionMode = getDimensionMode(spec);
 
@@ -2213,21 +2208,41 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
         <div className="control">
           <Callout className="intro">
             <p>
-              Each column in Druid must have an assigned type (string, long, float, complex, etc).
-              Default primitive types have been automatically assigned to your columns. If you want
-              to change the type, click on the column header.
+              Each column in Druid must have an assigned type (string, long, float, double, complex,
+              etc).
             </p>
-            <p>
-              Select whether or not you want to{' '}
-              <ExternalLink href="https://druid.apache.org/docs/latest/tutorials/tutorial-rollup.html">
-                roll-up
-              </ExternalLink>{' '}
-              your data.
-            </p>
+            {dimensionMode === 'specific' && (
+              <p>
+                Default primitive types have been automatically assigned to your columns. If you
+                want to change the type, click on the column header.
+              </p>
+            )}
+            <LearnMore href={`${getLink('DOCS')}/ingestion/schema-design.html`} />
           </Callout>
           {!somethingSelected && (
             <>
-              <FormGroup>
+              <FormGroupWithInfo
+                inlineInfo
+                info={
+                  <PopoverText>
+                    <p>
+                      Select whether or not you want to set an explicit list of{' '}
+                      <ExternalLink
+                        href={`${getLink('DOCS')}/ingestion/ingestion-spec.html#dimensionsspec`}
+                      >
+                        dimensions
+                      </ExternalLink>{' '}
+                      and{' '}
+                      <ExternalLink href={`${getLink('DOCS')}/querying/aggregations.html`}>
+                        metrics
+                      </ExternalLink>
+                      . Explicitly setting dimensions and metrics can lead to better compression and
+                      performance. If you disable this option, Druid will try to auto-detect fields
+                      in your data and treat them as individual columns.
+                    </p>
+                  </PopoverText>
+                }
+              >
                 <Switch
                   checked={dimensionMode === 'specific'}
                   onChange={() =>
@@ -2237,35 +2252,13 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
                   }
                   label="Explicitly specify dimension list"
                 />
-                <Popover
-                  content={
-                    <div className="label-info-text">
-                      <p>
-                        Select whether or not you want to set an explicit list of{' '}
-                        <ExternalLink href="https://druid.apache.org/docs/latest/ingestion/ingestion-spec.html#dimensionsspec">
-                          dimensions
-                        </ExternalLink>{' '}
-                        and{' '}
-                        <ExternalLink href="https://druid.apache.org/docs/latest/querying/aggregations.html">
-                          metrics
-                        </ExternalLink>
-                        . Explicitly setting dimensions and metrics can lead to better compression
-                        and performance. If you disable this option, Druid will try to auto-detect
-                        fields in your data and treat them as individual columns.
-                      </p>
-                    </div>
-                  }
-                  position="left-bottom"
-                >
-                  <Icon icon={IconNames.INFO_SIGN} iconSize={14} />
-                </Popover>
-              </FormGroup>
+              </FormGroupWithInfo>
               {dimensionMode === 'auto-detect' && (
                 <AutoForm
                   fields={[
                     {
-                      name: 'dataSchema.parser.parseSpec.dimensionsSpec.dimensionExclusions',
-                      label: 'Exclusions',
+                      name: 'spec.dataSchema.dimensionsSpec.dimensionExclusions',
+                      label: 'Dimension exclusions',
                       type: 'string-array',
                       info: (
                         <>
@@ -2279,46 +2272,44 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
                   onChange={s => this.updateSpec(s)}
                 />
               )}
-              <FormGroup>
+              <FormGroupWithInfo
+                inlineInfo
+                info={
+                  <PopoverText>
+                    <p>
+                      If you enable{' '}
+                      <ExternalLink href={`${getLink('DOCS')}/tutorials/tutorial-rollup.html`}>
+                        roll-up
+                      </ExternalLink>
+                      , Druid will try to pre-aggregate data before indexing it to conserve storage.
+                      The primary timestamp will be truncated to the specified query granularity,
+                      and rows containing the same string field values will be aggregated together.
+                    </p>
+                    <p>
+                      If you enable rollup, you must specify which columns are{' '}
+                      <a href={`${getLink('DOCS')}/ingestion/ingestion-spec.html#dimensionsspec`}>
+                        dimensions
+                      </a>{' '}
+                      (fields you want to group and filter on), and which are{' '}
+                      <a href={`${getLink('DOCS')}/querying/aggregations.html`}>metrics</a> (fields
+                      you want to aggregate on).
+                    </p>
+                  </PopoverText>
+                }
+              >
                 <Switch
                   checked={rollup}
                   onChange={() => this.setState({ newRollup: !rollup })}
                   labelElement="Rollup"
                 />
-                <Popover
-                  content={
-                    <div className="label-info-text">
-                      <p>
-                        If you enable roll-up, Druid will try to pre-aggregate data before indexing
-                        it to conserve storage. The primary timestamp will be truncated to the
-                        specified query granularity, and rows containing the same string field
-                        values will be aggregated together.
-                      </p>
-                      <p>
-                        If you enable rollup, you must specify which columns are{' '}
-                        <a href="https://druid.apache.org/docs/latest/ingestion/ingestion-spec.html#dimensionsspec">
-                          dimensions
-                        </a>{' '}
-                        (fields you want to group and filter on), and which are{' '}
-                        <a href="https://druid.apache.org/docs/latest/querying/aggregations.html">
-                          metrics
-                        </a>{' '}
-                        (fields you want to aggregate on).
-                      </p>
-                    </div>
-                  }
-                  position="left-bottom"
-                >
-                  <Icon icon={IconNames.INFO_SIGN} iconSize={14} />
-                </Popover>
-              </FormGroup>
+              </FormGroupWithInfo>
               <AutoForm
                 fields={[
                   {
-                    name: 'dataSchema.granularitySpec.queryGranularity',
+                    name: 'spec.dataSchema.granularitySpec.queryGranularity',
                     label: 'Query granularity',
                     type: 'string',
-                    suggestions: ['NONE', 'MINUTE', 'HOUR', 'DAY'],
+                    suggestions: ['NONE', 'SECOND', 'MINUTE', 'HOUR', 'DAY'],
                     info: (
                       <>
                         This granularity determines how timestamps will be truncated (not at all, to
@@ -2329,12 +2320,8 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
                   },
                 ]}
                 model={spec}
-                onChange={s => this.updateSpec(s)}
-                onFinalize={() => {
-                  setTimeout(() => {
-                    this.queryForSchema();
-                  }, 10);
-                }}
+                onChange={s => this.updateSpecPreview(s)}
+                onFinalize={this.applyPreviewSpec}
               />
             </>
           )}
@@ -2365,13 +2352,13 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
   };
 
   renderChangeRollupAction() {
-    const { newRollup, spec, sampleStrategy, cacheKey } = this.state;
-    if (typeof newRollup === 'undefined') return;
+    const { newRollup, spec, cacheRows } = this.state;
+    if (typeof newRollup === 'undefined' || !cacheRows) return;
 
     return (
       <AsyncActionDialog
         action={async () => {
-          const sampleResponse = await sampleForTransform(spec, sampleStrategy, cacheKey);
+          const sampleResponse = await sampleForTransform(spec, cacheRows);
           this.updateSpec(
             updateSchemaWithSample(
               spec,
@@ -2380,9 +2367,6 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
               newRollup,
             ),
           );
-          setTimeout(() => {
-            this.queryForSchema();
-          }, 10);
         }}
         confirmButtonText={`Yes - ${newRollup ? 'enable' : 'disable'} rollup`}
         successText={`Rollup was ${newRollup ? 'enabled' : 'disabled'}. Schema has been updated.`}
@@ -2397,14 +2381,14 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
   }
 
   renderChangeDimensionModeAction() {
-    const { newDimensionMode, spec, sampleStrategy, cacheKey } = this.state;
-    if (typeof newDimensionMode === 'undefined') return;
+    const { newDimensionMode, spec, cacheRows } = this.state;
+    if (typeof newDimensionMode === 'undefined' || !cacheRows) return;
     const autoDetect = newDimensionMode === 'auto-detect';
 
     return (
       <AsyncActionDialog
         action={async () => {
-          const sampleResponse = await sampleForTransform(spec, sampleStrategy, cacheKey);
+          const sampleResponse = await sampleForTransform(spec, cacheRows);
           this.updateSpec(
             updateSchemaWithSample(
               spec,
@@ -2413,9 +2397,6 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
               getRollup(spec),
             ),
           );
-          setTimeout(() => {
-            this.queryForSchema();
-          }, 10);
         }}
         confirmButtonText={`Yes - ${autoDetect ? 'auto detect' : 'explicitly set'} columns`}
         successText={`Dimension mode changes to ${
@@ -2445,16 +2426,58 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
       });
     };
 
-    const closeAndQuery = () => {
-      close();
-      setTimeout(() => {
-        this.queryForSchema();
-      }, 10);
-    };
-
     if (selectedDimensionSpec) {
       const curDimensions =
-        deepGet(spec, `dataSchema.parser.parseSpec.dimensionsSpec.dimensions`) || EMPTY_ARRAY;
+        deepGet(spec, `spec.dataSchema.dimensionsSpec.dimensions`) || EMPTY_ARRAY;
+
+      const convertToMetric = (type: string, prefix: string) => {
+        const specWithoutDimension = deepDelete(
+          spec,
+          `spec.dataSchema.dimensionsSpec.dimensions.${selectedDimensionSpecIndex}`,
+        );
+
+        const specWithMetric = deepSet(
+          specWithoutDimension,
+          `spec.dataSchema.metricsSpec.[append]`,
+          {
+            name: `${prefix}_${selectedDimensionSpec.name}`,
+            type,
+            fieldName: selectedDimensionSpec.name,
+          },
+        );
+
+        this.updateSpec(specWithMetric);
+        close();
+      };
+
+      const convertToMetricMenu = (
+        <Menu>
+          <MenuItem
+            text="Convert to longSum metric"
+            onClick={() => convertToMetric('longSum', 'sum')}
+          />
+          <MenuItem
+            text="Convert to doubleSum metric"
+            onClick={() => convertToMetric('doubleSum', 'sum')}
+          />
+          <MenuItem
+            text="Convert to thetaSketch metric"
+            onClick={() => convertToMetric('thetaSketch', 'theta')}
+          />
+          <MenuItem
+            text="Convert to HLLSketchBuild metric"
+            onClick={() => convertToMetric('HLLSketchBuild', 'hll')}
+          />
+          <MenuItem
+            text="Convert to quantilesDoublesSketch metric"
+            onClick={() => convertToMetric('quantilesDoublesSketch', 'quantiles_doubles')}
+          />
+          <MenuItem
+            text="Convert to hyperUnique metric"
+            onClick={() => convertToMetric('hyperUnique', 'unique')}
+          />
+        </Menu>
+      );
 
       return (
         <div className="edit-controls">
@@ -2463,24 +2486,37 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
             model={selectedDimensionSpec}
             onChange={selectedDimensionSpec => this.setState({ selectedDimensionSpec })}
           />
-          <div className="controls-buttons">
+          {selectedDimensionSpecIndex !== -1 && deepGet(spec, 'spec.dataSchema.metricsSpec') && (
+            <FormGroup>
+              <Popover content={convertToMetricMenu}>
+                <Button
+                  icon={IconNames.EXCHANGE}
+                  text="Convert to metric"
+                  rightIcon={IconNames.CARET_DOWN}
+                  disabled={curDimensions.length <= 1}
+                />
+              </Popover>
+            </FormGroup>
+          )}
+          <div className="control-buttons">
             <Button
-              className="add-update"
-              text={selectedDimensionSpecIndex === -1 ? 'Add' : 'Update'}
+              text="Apply"
               intent={Intent.PRIMARY}
               onClick={() => {
                 this.updateSpec(
                   deepSet(
                     spec,
-                    `dataSchema.parser.parseSpec.dimensionsSpec.dimensions.${selectedDimensionSpecIndex}`,
+                    `spec.dataSchema.dimensionsSpec.dimensions.${selectedDimensionSpecIndex}`,
                     selectedDimensionSpec,
                   ),
                 );
-                closeAndQuery();
+                close();
               }}
             />
+            <Button text="Cancel" onClick={close} />
             {selectedDimensionSpecIndex !== -1 && (
               <Button
+                className="right"
                 icon={IconNames.TRASH}
                 intent={Intent.DANGER}
                 disabled={curDimensions.length <= 1}
@@ -2490,14 +2526,13 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
                   this.updateSpec(
                     deepDelete(
                       spec,
-                      `dataSchema.parser.parseSpec.dimensionsSpec.dimensions.${selectedDimensionSpecIndex}`,
+                      `spec.dataSchema.dimensionsSpec.dimensions.${selectedDimensionSpecIndex}`,
                     ),
                   );
-                  closeAndQuery();
+                  close();
                 }}
               />
             )}
-            <Button className="cancel" text="Cancel" onClick={close} />
           </div>
         </div>
       );
@@ -2532,14 +2567,41 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
       });
     };
 
-    const closeAndQuery = () => {
-      close();
-      setTimeout(() => {
-        this.queryForSchema();
-      }, 10);
-    };
-
     if (selectedMetricSpec) {
+      const convertToDimension = (type: string) => {
+        const specWithoutMetric = deepDelete(
+          spec,
+          `spec.dataSchema.metricsSpec.${selectedMetricSpecIndex}`,
+        );
+
+        const specWithDimension = deepSet(
+          specWithoutMetric,
+          `spec.dataSchema.dimensionsSpec.dimensions.[append]`,
+          {
+            type,
+            name: selectedMetricSpec.fieldName,
+          },
+        );
+
+        this.updateSpec(specWithDimension);
+        close();
+      };
+
+      const convertToDimensionMenu = (
+        <Menu>
+          <MenuItem
+            text="Convert to string dimension"
+            onClick={() => convertToDimension('string')}
+          />
+          <MenuItem text="Convert to long dimension" onClick={() => convertToDimension('long')} />
+          <MenuItem text="Convert to float dimension" onClick={() => convertToDimension('float')} />
+          <MenuItem
+            text="Convert to double dimension"
+            onClick={() => convertToDimension('double')}
+          />
+        </Menu>
+      );
+
       return (
         <div className="edit-controls">
           <AutoForm
@@ -2547,35 +2609,46 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
             model={selectedMetricSpec}
             onChange={selectedMetricSpec => this.setState({ selectedMetricSpec })}
           />
-          <div className="controls-buttons">
+          {selectedMetricSpecIndex !== -1 && (
+            <FormGroup>
+              <Popover content={convertToDimensionMenu}>
+                <Button
+                  icon={IconNames.EXCHANGE}
+                  text="Convert to dimension"
+                  rightIcon={IconNames.CARET_DOWN}
+                />
+              </Popover>
+            </FormGroup>
+          )}
+          <div className="control-buttons">
             <Button
-              className="add-update"
-              text={selectedMetricSpecIndex === -1 ? 'Add' : 'Update'}
+              text="Apply"
               intent={Intent.PRIMARY}
               onClick={() => {
                 this.updateSpec(
                   deepSet(
                     spec,
-                    `dataSchema.metricsSpec.${selectedMetricSpecIndex}`,
+                    `spec.dataSchema.metricsSpec.${selectedMetricSpecIndex}`,
                     selectedMetricSpec,
                   ),
                 );
-                closeAndQuery();
+                close();
               }}
             />
+            <Button text="Cancel" onClick={close} />
             {selectedMetricSpecIndex !== -1 && (
               <Button
+                className="right"
                 icon={IconNames.TRASH}
                 intent={Intent.DANGER}
                 onClick={() => {
                   this.updateSpec(
-                    deepDelete(spec, `dataSchema.metricsSpec.${selectedMetricSpecIndex}`),
+                    deepDelete(spec, `spec.dataSchema.metricsSpec.${selectedMetricSpecIndex}`),
                   );
-                  closeAndQuery();
+                  close();
                 }}
               />
             )}
-            <Button className="cancel" text="Cancel" onClick={close} />
           </div>
         </div>
       );
@@ -2604,9 +2677,9 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
 
   renderPartitionStep() {
     const { spec } = this.state;
-    const tuningConfig: TuningConfig = deepGet(spec, 'tuningConfig') || EMPTY_OBJECT;
+    const tuningConfig: TuningConfig = deepGet(spec, 'spec.tuningConfig') || EMPTY_OBJECT;
     const granularitySpec: GranularitySpec =
-      deepGet(spec, 'dataSchema.granularitySpec') || EMPTY_OBJECT;
+      deepGet(spec, 'spec.dataSchema.granularitySpec') || EMPTY_OBJECT;
 
     return (
       <>
@@ -2637,16 +2710,16 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
               },
             ]}
             model={granularitySpec}
-            onChange={g => this.updateSpec(deepSet(spec, 'dataSchema.granularitySpec', g))}
+            onChange={g => this.updateSpec(deepSet(spec, 'spec.dataSchema.granularitySpec', g))}
           />
           <AutoForm
             fields={[
               {
-                name: 'dataSchema.granularitySpec.intervals',
+                name: 'spec.dataSchema.granularitySpec.intervals',
                 label: 'Time intervals',
                 type: 'string-array',
                 placeholder: 'ex: 2018-01-01/2018-06-01',
-                required: s => Boolean(deepGet(s, 'tuningConfig.forceGuaranteedRollup')),
+                required: spec => Boolean(deepGet(spec, 'spec.tuningConfig.forceGuaranteedRollup')),
                 info: (
                   <>
                     A comma separated list of intervals for the raw data being ingested. Ignored for
@@ -2662,17 +2735,18 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
         <div className="other">
           <H5>Secondary partitioning</H5>
           <AutoForm
-            fields={getPartitionRelatedTuningSpecFormFields(getSpecType(spec) || 'index')}
+            fields={getPartitionRelatedTuningSpecFormFields(getSpecType(spec) || 'index_parallel')}
             model={tuningConfig}
-            onChange={t => this.updateSpec(deepSet(spec, 'tuningConfig', t))}
+            globalAdjustment={adjustTuningConfig}
+            onChange={t => this.updateSpec(deepSet(spec, 'spec.tuningConfig', t))}
           />
         </div>
         <div className="control">
           <Callout className="intro">
             <p className="optional">Optional</p>
             <p>Configure how Druid will partition data.</p>
+            <LearnMore href={`${getLink('DOCS')}/ingestion/index.html#partitioning`} />
           </Callout>
-          {this.renderParallelPickerIfNeeded()}
         </div>
         {this.renderNextBar({
           disabled:
@@ -2687,8 +2761,8 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
 
   renderTuningStep() {
     const { spec } = this.state;
-    const ioConfig: IoConfig = deepGet(spec, 'ioConfig') || EMPTY_OBJECT;
-    const tuningConfig: TuningConfig = deepGet(spec, 'tuningConfig') || EMPTY_OBJECT;
+    const ioConfig: IoConfig = deepGet(spec, 'spec.ioConfig') || EMPTY_OBJECT;
+    const tuningConfig: TuningConfig = deepGet(spec, 'spec.tuningConfig') || EMPTY_OBJECT;
 
     const ingestionComboType = getIngestionComboType(spec);
     const inputTuningFields = ingestionComboType
@@ -2703,14 +2777,14 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
               <AutoForm
                 fields={inputTuningFields}
                 model={ioConfig}
-                onChange={c => this.updateSpec(deepSet(spec, 'ioConfig', c))}
+                onChange={c => this.updateSpec(deepSet(spec, 'spec.ioConfig', c))}
               />
             ) : (
               <div>
-                {ioConfig.firehose
-                  ? `No specific tuning configs for firehose of type '${deepGet(
+                {ioConfig.inputSource
+                  ? `No specific tuning configs for inputSource of type '${deepGet(
                       ioConfig,
-                      'firehose.type',
+                      'inputSource.type',
                     )}'.`
                   : `No specific tuning configs.`}
               </div>
@@ -2718,7 +2792,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
           ) : (
             <JsonInput
               value={ioConfig}
-              onChange={c => this.updateSpec(deepSet(spec, 'ioConfig', c))}
+              onChange={c => this.updateSpec(deepSet(spec, 'spec.ioConfig', c))}
               height="300px"
             />
           )}
@@ -2728,15 +2802,15 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
           <AutoForm
             fields={getTuningSpecFormFields()}
             model={tuningConfig}
-            onChange={t => this.updateSpec(deepSet(spec, 'tuningConfig', t))}
+            onChange={t => this.updateSpec(deepSet(spec, 'spec.tuningConfig', t))}
           />
         </div>
         <div className="control">
           <Callout className="intro">
             <p className="optional">Optional</p>
             <p>Fine tune how Druid will ingest data.</p>
+            <LearnMore href={`${getLink('DOCS')}/ingestion/index.html#tuningconfig`} />
           </Callout>
-          {this.renderParallelPickerIfNeeded()}
         </div>
         {this.renderNextBar({
           disabled: invalidIoConfig(ioConfig),
@@ -2745,44 +2819,11 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
     );
   }
 
-  renderParallelPickerIfNeeded(): JSX.Element | undefined {
-    const { spec } = this.state;
-    if (!hasParallelAbility(spec)) return;
-
-    return (
-      <FormGroup>
-        <Switch
-          large
-          checked={isParallel(spec)}
-          onChange={() => this.updateSpec(changeParallel(spec, !isParallel(spec)))}
-          labelElement={
-            <>
-              {'Parallel indexing '}
-              <Popover
-                content={
-                  <div className="label-info-text">
-                    Druid currently has two types of native batch indexing tasks,{' '}
-                    <Code>index_parallel</Code> which runs tasks in parallel on multiple
-                    MiddleManager processes, and <Code>index</Code> which will run a single indexing
-                    task locally on a single MiddleManager.
-                  </div>
-                }
-                position="left-bottom"
-              >
-                <Icon icon={IconNames.INFO_SIGN} iconSize={16} />
-              </Popover>
-            </>
-          }
-        />
-      </FormGroup>
-    );
-  }
-
   // ==================================================================
 
   renderPublishStep() {
     const { spec } = this.state;
-    const parallel = isParallel(spec);
+    const parallel = deepGet(spec, 'spec.tuningConfig.maxNumConcurrentSubTasks') > 1;
 
     return (
       <>
@@ -2791,17 +2832,17 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
           <AutoForm
             fields={[
               {
-                name: 'dataSchema.dataSource',
+                name: 'spec.dataSchema.dataSource',
                 label: 'Datasource name',
                 type: 'string',
                 info: <>This is the name of the data source (table) in Druid.</>,
               },
               {
-                name: 'ioConfig.appendToExisting',
+                name: 'spec.ioConfig.appendToExisting',
                 label: 'Append to existing',
                 type: 'boolean',
                 defaultValue: false,
-                defined: spec => !deepGet(spec, 'tuningConfig.forceGuaranteedRollup'),
+                defined: spec => !deepGet(spec, 'spec.tuningConfig.forceGuaranteedRollup'),
                 info: (
                   <>
                     Creates segments as additional shards of the latest version, effectively
@@ -2819,7 +2860,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
           <AutoForm
             fields={[
               {
-                name: 'tuningConfig.logParseExceptions',
+                name: 'spec.tuningConfig.logParseExceptions',
                 label: 'Log parse exceptions',
                 type: 'boolean',
                 defaultValue: false,
@@ -2832,7 +2873,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
                 ),
               },
               {
-                name: 'tuningConfig.maxParseExceptions',
+                name: 'spec.tuningConfig.maxParseExceptions',
                 label: 'Max parse exceptions',
                 type: 'number',
                 disabled: parallel,
@@ -2845,7 +2886,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
                 ),
               },
               {
-                name: 'tuningConfig.maxSavedParseExceptions',
+                name: 'spec.tuningConfig.maxSavedParseExceptions',
                 label: 'Max saved parse exceptions',
                 type: 'number',
                 disabled: parallel,
@@ -2872,7 +2913,6 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
           <Callout className="intro">
             <p>Configure behavior of indexed data once it reaches Druid.</p>
           </Callout>
-          {this.renderParallelPickerIfNeeded()}
         </div>
         {this.renderNextBar({})}
       </>
@@ -2885,7 +2925,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
 
     try {
       const resp = await axios.get(`/druid/indexer/v1/supervisor/${initSupervisorId}`);
-      this.updateSpec(resp.data);
+      this.updateSpec(cleanSpec(resp.data));
       this.setState({ continueToSpec: true });
       this.updateStep('spec');
     } catch (e) {
@@ -2901,7 +2941,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
 
     try {
       const resp = await axios.get(`/druid/indexer/v1/task/${initTaskId}`);
-      this.updateSpec(resp.data.payload);
+      this.updateSpec(cleanSpec(resp.data.payload));
       this.setState({ continueToSpec: true });
       this.updateStep('spec');
     } catch (e) {
@@ -2911,10 +2951,6 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
       });
     }
   };
-
-  renderLoading() {
-    return <Loader loading />;
-  }
 
   renderSpecStep() {
     const { spec, submitting } = this.state;
@@ -2964,7 +3000,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
   }
 
   private handleSubmit = async () => {
-    const { goToTask } = this.props;
+    const { goToIngestion } = this.props;
     const { spec, submitting } = this.state;
     if (submitting) return;
 
@@ -2972,13 +3008,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
     if (isTask(spec)) {
       let taskResp: any;
       try {
-        taskResp = await axios.post('/druid/indexer/v1/task', {
-          type: spec.type,
-          spec,
-
-          // A hack to let context be set from the spec can be removed when https://github.com/apache/incubator-druid/issues/8662 is resolved
-          context: (spec as any).context,
-        });
+        taskResp = await axios.post('/druid/indexer/v1/task', spec);
       } catch (e) {
         AppToaster.show({
           message: `Failed to submit task: ${getDruidErrorMessage(e)}`,
@@ -2994,7 +3024,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
       });
 
       setTimeout(() => {
-        goToTask(taskResp.data.task);
+        goToIngestion(taskResp.data.task);
       }, 1000);
     } else {
       try {
@@ -3014,7 +3044,7 @@ export class LoadDataView extends React.PureComponent<LoadDataViewProps, LoadDat
       });
 
       setTimeout(() => {
-        goToTask(undefined); // Can we get the supervisor ID here?
+        goToIngestion(undefined); // Can we get the supervisor ID here?
       }, 1000);
     }
   };

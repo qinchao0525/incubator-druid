@@ -16,17 +16,7 @@
  * limitations under the License.
  */
 
-import {
-  Button,
-  FormGroup,
-  InputGroup,
-  Intent,
-  Menu,
-  MenuItem,
-  Popover,
-  Position,
-  Switch,
-} from '@blueprintjs/core';
+import { FormGroup, InputGroup, Intent, MenuItem, Switch } from '@blueprintjs/core';
 import { IconNames } from '@blueprintjs/icons';
 import axios from 'axios';
 import classNames from 'classnames';
@@ -38,11 +28,12 @@ import {
   ACTION_COLUMN_LABEL,
   ACTION_COLUMN_WIDTH,
   ActionCell,
+  ActionIcon,
+  MoreButton,
   RefreshButton,
   TableColumnSelector,
   ViewControlBar,
 } from '../../components';
-import { ActionIcon } from '../../components/action-icon/action-icon';
 import { SegmentTimeline } from '../../components/segment-timeline/segment-timeline';
 import { AsyncActionDialog, CompactionDialog, RetentionDialog } from '../../dialogs';
 import { DatasourceTableActionDialog } from '../../dialogs/datasource-table-action-dialog/datasource-table-action-dialog';
@@ -61,34 +52,47 @@ import {
   QueryManager,
 } from '../../utils';
 import { BasicAction } from '../../utils/basic-action';
+import { Capabilities, CapabilitiesMode } from '../../utils/capabilities';
 import { RuleUtil } from '../../utils/load-rule';
 import { LocalStorageBackedArray } from '../../utils/local-storage-backed-array';
 import { deepGet } from '../../utils/object-change';
 
 import './datasource-view.scss';
 
-const tableColumns: string[] = [
-  'Datasource',
-  'Availability',
-  'Segment load/drop',
-  'Retention',
-  'Replicated size',
-  'Size',
-  'Compaction',
-  'Avg. segment size',
-  'Num rows',
-  ACTION_COLUMN_LABEL,
-];
-const tableColumnsNoSql: string[] = [
-  'Datasource',
-  'Availability',
-  'Segment load/drop',
-  'Retention',
-  'Size',
-  'Compaction',
-  'Avg. segment size',
-  ACTION_COLUMN_LABEL,
-];
+const tableColumns: Record<CapabilitiesMode, string[]> = {
+  full: [
+    'Datasource',
+    'Availability',
+    'Segment load/drop',
+    'Retention',
+    'Replicated size',
+    'Size',
+    'Compaction',
+    'Avg. segment size',
+    'Num rows',
+    ACTION_COLUMN_LABEL,
+  ],
+  'no-sql': [
+    'Datasource',
+    'Availability',
+    'Segment load/drop',
+    'Retention',
+    'Size',
+    'Compaction',
+    'Avg. segment size',
+    ACTION_COLUMN_LABEL,
+  ],
+  'no-proxy': [
+    'Datasource',
+    'Availability',
+    'Segment load/drop',
+    'Replicated size',
+    'Size',
+    'Avg. segment size',
+    'Num rows',
+    ACTION_COLUMN_LABEL,
+  ],
+};
 
 function formatLoadDrop(segmentsToLoad: number, segmentsToDrop: number): string {
   const loadDrop: string[] = [];
@@ -133,7 +137,7 @@ export interface DatasourcesViewProps {
   goToQuery: (initSql: string) => void;
   goToTask: (datasource?: string, openDialog?: string) => void;
   goToSegments: (datasource: string, onlyUnavailable?: boolean) => void;
-  noSqlMode: boolean;
+  capabilities: Capabilities;
   initDatasource?: string;
 }
 
@@ -145,15 +149,15 @@ export interface DatasourcesViewState {
   datasourcesError?: string;
   datasourceFilter: Filter[];
 
-  showDisabled: boolean;
+  showUnused: boolean;
   retentionDialogOpenOn?: RetentionDialogOpenOn;
   compactionDialogOpenOn?: CompactionDialogOpenOn;
-  dropDataDatasource?: string;
-  enableDatasource?: string;
+  datasourceToMarkAsUnusedAllSegmentsIn?: string;
+  datasourceToMarkAllNonOvershadowedSegmentsAsUsedIn?: string;
   killDatasource?: string;
-  dropReloadDatasource?: string;
-  dropReloadAction: 'drop' | 'reload';
-  dropReloadInterval: string;
+  datasourceToMarkSegmentsByIntervalIn?: string;
+  useUnuseAction: 'use' | 'unuse';
+  useUnuseInterval: string;
   hiddenColumns: LocalStorageBackedArray<string>;
   showChart: boolean;
   chartWidth: number;
@@ -167,7 +171,7 @@ export class DatasourcesView extends React.PureComponent<
   DatasourcesViewProps,
   DatasourcesViewState
 > {
-  static DISABLED_COLOR = '#0a1500';
+  static UNUSED_COLOR = '#0a1500';
   static FULLY_AVAILABLE_COLOR = '#57d500';
   static PARTIALLY_AVAILABLE_COLOR = '#ffbf00';
 
@@ -198,7 +202,7 @@ GROUP BY 1`;
   }
 
   private datasourceQueryManager: QueryManager<
-    boolean,
+    Capabilities,
     { tiers: string[]; defaultRules: any[]; datasources: Datasource[] }
   >;
 
@@ -217,9 +221,9 @@ GROUP BY 1`;
       defaultRules: [],
       datasourceFilter,
 
-      showDisabled: false,
-      dropReloadAction: 'drop',
-      dropReloadInterval: '',
+      showUnused: false,
+      useUnuseAction: 'unuse',
+      useUnuseInterval: '',
       hiddenColumns: new LocalStorageBackedArray<string>(
         LocalStorageKeys.DATASOURCE_TABLE_COLUMN_SELECTION,
       ),
@@ -231,11 +235,11 @@ GROUP BY 1`;
     };
 
     this.datasourceQueryManager = new QueryManager({
-      processQuery: async noSqlMode => {
+      processQuery: async capabilities => {
         let datasources: DatasourceQueryResultRow[];
-        if (!noSqlMode) {
+        if (capabilities.hasSql()) {
           datasources = await queryDruidSql({ query: DatasourcesView.DATASOURCE_SQL });
-        } else {
+        } else if (capabilities.hasCoordinatorAccess()) {
           const datasourcesResp = await axios.get('/druid/coordinator/v1/datasources?simple');
           const loadstatusResp = await axios.get('/druid/coordinator/v1/loadstatus?simple');
           const loadstatus = loadstatusResp.data;
@@ -258,16 +262,31 @@ GROUP BY 1`;
               };
             },
           );
+        } else {
+          throw new Error(`must have SQL or coordinator access`);
+        }
+
+        if (!capabilities.hasCoordinatorAccess()) {
+          datasources.forEach((ds: any) => {
+            ds.rules = [];
+          });
+          return {
+            datasources,
+            tiers: [],
+            defaultRules: [],
+          };
         }
 
         const seen = countBy(datasources, (x: any) => x.datasource);
 
-        let disabled: string[] = [];
-        if (this.state.showDisabled) {
-          const disabledResp = await axios.get(
+        let unused: string[] = [];
+        if (this.state.showUnused) {
+          // Using 'includeDisabled' parameter for compatibility.
+          // Should be changed to 'includeUnused' in Druid 0.17
+          const unusedResp = await axios.get(
             '/druid/coordinator/v1/metadata/datasources?includeDisabled',
           );
-          disabled = disabledResp.data.filter((d: string) => !seen[d]);
+          unused = unusedResp.data.filter((d: string) => !seen[d]);
         }
 
         const rulesResp = await axios.get('/druid/coordinator/v1/rules');
@@ -283,7 +302,7 @@ GROUP BY 1`;
         const tiers = tiersResp.data;
 
         const allDatasources = (datasources as any).concat(
-          disabled.map(d => ({ datasource: d, disabled: true })),
+          unused.map(d => ({ datasource: d, unused: true })),
         );
         allDatasources.forEach((ds: any) => {
           ds.rules = rules[ds.datasource] || [];
@@ -320,8 +339,8 @@ GROUP BY 1`;
   };
 
   componentDidMount(): void {
-    const { noSqlMode } = this.props;
-    this.datasourceQueryManager.runQuery(noSqlMode);
+    const { capabilities } = this.props;
+    this.datasourceQueryManager.runQuery(capabilities);
     window.addEventListener('resize', this.handleResize);
   }
 
@@ -329,104 +348,103 @@ GROUP BY 1`;
     this.datasourceQueryManager.terminate();
   }
 
-  renderDropDataAction() {
-    const { dropDataDatasource } = this.state;
-    if (!dropDataDatasource) return;
+  renderUnuseAction() {
+    const { datasourceToMarkAsUnusedAllSegmentsIn } = this.state;
+    if (!datasourceToMarkAsUnusedAllSegmentsIn) return;
 
     return (
       <AsyncActionDialog
         action={async () => {
           const resp = await axios.delete(
-            `/druid/coordinator/v1/datasources/${dropDataDatasource}`,
+            `/druid/coordinator/v1/datasources/${datasourceToMarkAsUnusedAllSegmentsIn}`,
             {},
           );
           return resp.data;
         }}
-        confirmButtonText="Drop data"
-        successText="Data drop request acknowledged, next time the coordinator runs data will be dropped"
-        failText="Could not drop data"
+        confirmButtonText="Mark as unused all segments"
+        successText="All segments in data source have been marked as unused"
+        failText="Failed to mark as unused all segments in data source"
         intent={Intent.DANGER}
         onClose={() => {
-          this.setState({ dropDataDatasource: undefined });
+          this.setState({ datasourceToMarkAsUnusedAllSegmentsIn: undefined });
         }}
         onSuccess={() => {
           this.datasourceQueryManager.rerunLastQuery();
         }}
       >
         <p>
-          {`Are you sure you want to drop all the data for datasource '${dropDataDatasource}'?`}
+          {`Are you sure you want to mark as unused all segments in '${datasourceToMarkAsUnusedAllSegmentsIn}'?`}
         </p>
       </AsyncActionDialog>
     );
   }
 
-  renderEnableAction() {
-    const { enableDatasource } = this.state;
-    if (!enableDatasource) return;
+  renderUseAction() {
+    const { datasourceToMarkAllNonOvershadowedSegmentsAsUsedIn } = this.state;
+    if (!datasourceToMarkAllNonOvershadowedSegmentsAsUsedIn) return;
 
     return (
       <AsyncActionDialog
         action={async () => {
           const resp = await axios.post(
-            `/druid/coordinator/v1/datasources/${enableDatasource}`,
+            `/druid/coordinator/v1/datasources/${datasourceToMarkAllNonOvershadowedSegmentsAsUsedIn}`,
             {},
           );
           return resp.data;
         }}
-        confirmButtonText="Enable datasource"
-        successText="Datasource has been enabled"
-        failText="Could not enable datasource"
+        confirmButtonText="Mark as used all segments"
+        successText="All non-overshadowed segments in data source have been marked as used"
+        failText="Failed to mark as used all non-overshadowed segments in data source"
         intent={Intent.PRIMARY}
         onClose={() => {
-          this.setState({ enableDatasource: undefined });
+          this.setState({ datasourceToMarkAllNonOvershadowedSegmentsAsUsedIn: undefined });
         }}
         onSuccess={() => {
           this.datasourceQueryManager.rerunLastQuery();
         }}
       >
-        <p>{`Are you sure you want to enable datasource '${enableDatasource}'?`}</p>
+        <p>{`Are you sure you want to mark as used all non-overshadowed segments in '${datasourceToMarkAllNonOvershadowedSegmentsAsUsedIn}'?`}</p>
       </AsyncActionDialog>
     );
   }
 
-  renderDropReloadAction() {
-    const { dropReloadDatasource, dropReloadAction, dropReloadInterval } = this.state;
-    if (!dropReloadDatasource) return;
-    const isDrop = dropReloadAction === 'drop';
-
+  renderUseUnuseActionByInterval() {
+    const { datasourceToMarkSegmentsByIntervalIn, useUnuseAction, useUnuseInterval } = this.state;
+    if (!datasourceToMarkSegmentsByIntervalIn) return;
+    const isUse = useUnuseAction === 'use';
+    const usedWord = isUse ? 'used' : 'unused';
     return (
       <AsyncActionDialog
         action={async () => {
-          if (!dropReloadInterval) return;
+          if (!useUnuseInterval) return;
+          const param = isUse ? 'markUsed' : 'markUnused';
           const resp = await axios.post(
-            `/druid/coordinator/v1/datasources/${dropReloadDatasource}/${
-              isDrop ? 'markUnused' : 'markUsed'
-            }`,
+            `/druid/coordinator/v1/datasources/${datasourceToMarkSegmentsByIntervalIn}/${param}`,
             {
-              interval: dropReloadInterval,
+              interval: useUnuseInterval,
             },
           );
           return resp.data;
         }}
-        confirmButtonText={`${isDrop ? 'Drop' : 'Reload'} selected data`}
-        confirmButtonDisabled={!/.\/./.test(dropReloadInterval)}
-        successText={`${isDrop ? 'Drop' : 'Reload'} request submitted`}
-        failText={`Could not ${isDrop ? 'drop' : 'reload'} data`}
+        confirmButtonText={`Mark as ${usedWord} segments in the interval`}
+        confirmButtonDisabled={!/.\/./.test(useUnuseInterval)}
+        successText={`Segments in the interval in data source have been marked as ${usedWord}`}
+        failText={`Failed to mark as ${usedWord} segments in the interval in data source`}
         intent={Intent.PRIMARY}
         onClose={() => {
-          this.setState({ dropReloadDatasource: undefined });
+          this.setState({ datasourceToMarkSegmentsByIntervalIn: undefined });
         }}
         onSuccess={() => {
           this.datasourceQueryManager.rerunLastQuery();
         }}
       >
-        <p>{`Please select the interval that you want to ${isDrop ? 'drop' : 'reload'}?`}</p>
+        <p>{`Please select the interval in which you want to mark segments as ${usedWord} in '${datasourceToMarkSegmentsByIntervalIn}'?`}</p>
         <FormGroup>
           <InputGroup
-            value={dropReloadInterval}
+            value={useUnuseInterval}
             onChange={(e: any) => {
               const v = e.target.value;
-              this.setState({ dropReloadInterval: v.toUpperCase() });
+              this.setState({ useUnuseInterval: v.toUpperCase() });
             }}
             placeholder="2018-01-01T00:00:00/2018-01-03T00:00:00"
           />
@@ -448,9 +466,9 @@ GROUP BY 1`;
           );
           return resp.data;
         }}
-        confirmButtonText="Permanently delete data"
-        successText="Kill task was issued. Datasource will be deleted"
-        failText="Could not submit kill task"
+        confirmButtonText="Permanently delete unused segments"
+        successText="Kill task was issued. Unused segments in data source will be deleted"
+        failText="Failed submit kill task"
         intent={Intent.DANGER}
         onClose={() => {
           this.setState({ killDatasource: undefined });
@@ -460,7 +478,7 @@ GROUP BY 1`;
         }}
       >
         <p>
-          {`Are you sure you want to permanently delete the deep storage data for datasource '${killDatasource}'?`}
+          {`Are you sure you want to permanently delete unused segments in '${killDatasource}'?`}
         </p>
         <p>This action is not reversible and the data deleted will be lost.</p>
       </AsyncActionDialog>
@@ -468,25 +486,18 @@ GROUP BY 1`;
   }
 
   renderBulkDatasourceActions() {
-    const { goToQuery, noSqlMode } = this.props;
-    const bulkDatasourceActionsMenu = (
-      <Menu>
-        {!noSqlMode && (
+    const { goToQuery, capabilities } = this.props;
+
+    return (
+      <MoreButton>
+        {capabilities.hasSql() && (
           <MenuItem
             icon={IconNames.APPLICATION}
             text="View SQL query for table"
             onClick={() => goToQuery(DatasourcesView.DATASOURCE_SQL)}
           />
         )}
-      </Menu>
-    );
-
-    return (
-      <>
-        <Popover content={bulkDatasourceActionsMenu} position={Position.BOTTOM_LEFT}>
-          <Button icon={IconNames.MORE} />
-        </Popover>
-      </>
+      </MoreButton>
     );
   }
 
@@ -568,27 +579,48 @@ GROUP BY 1`;
     });
   };
 
-  private toggleDisabled(showDisabled: boolean) {
-    if (!showDisabled) {
+  private toggleUnused(showUnused: boolean) {
+    if (!showUnused) {
       this.datasourceQueryManager.rerunLastQuery();
     }
-    this.setState({ showDisabled: !showDisabled });
+    this.setState({ showUnused: !showUnused });
   }
 
   getDatasourceActions(
     datasource: string,
-    disabled: boolean,
+    unused: boolean,
     rules: any[],
     compactionConfig: Record<string, any>,
   ): BasicAction[] {
-    const { goToQuery, goToTask } = this.props;
+    const { goToQuery, goToTask, capabilities } = this.props;
 
-    if (disabled) {
+    const goToActions: BasicAction[] = [
+      {
+        icon: IconNames.APPLICATION,
+        title: 'Query with SQL',
+        onAction: () => goToQuery(`SELECT * FROM ${escapeSqlIdentifier(datasource)}`),
+      },
+      {
+        icon: IconNames.GANTT_CHART,
+        title: 'Go to tasks',
+        onAction: () => goToTask(datasource),
+      },
+    ];
+
+    if (!capabilities.hasCoordinatorAccess()) {
+      return goToActions;
+    }
+
+    if (unused) {
       return [
         {
           icon: IconNames.EXPORT,
-          title: 'Enable',
-          onAction: () => this.setState({ enableDatasource: datasource }),
+          title: 'Mark as used all segments',
+
+          onAction: () =>
+            this.setState({
+              datasourceToMarkAllNonOvershadowedSegmentsAsUsedIn: datasource,
+            }),
         },
         {
           icon: IconNames.TRASH,
@@ -598,17 +630,7 @@ GROUP BY 1`;
         },
       ];
     } else {
-      return [
-        {
-          icon: IconNames.APPLICATION,
-          title: 'Query with SQL',
-          onAction: () => goToQuery(`SELECT * FROM ${escapeSqlIdentifier(datasource)}`),
-        },
-        {
-          icon: IconNames.GANTT_CHART,
-          title: 'Go to tasks',
-          onAction: () => goToTask(datasource),
-        },
+      return goToActions.concat([
         {
           icon: IconNames.AUTOMATIC_UPDATES,
           title: 'Edit retention rules',
@@ -620,6 +642,14 @@ GROUP BY 1`;
               },
             });
           },
+        },
+        {
+          icon: IconNames.REFRESH,
+          title: 'Mark as used all segments (will lead to reapplying retention rules)',
+          onAction: () =>
+            this.setState({
+              datasourceToMarkAllNonOvershadowedSegmentsAsUsedIn: datasource,
+            }),
         },
         {
           icon: IconNames.COMPRESSED,
@@ -635,21 +665,29 @@ GROUP BY 1`;
         },
         {
           icon: IconNames.EXPORT,
-          title: 'Reload data by interval',
+          title: 'Mark as used segments by interval',
+
           onAction: () =>
-            this.setState({ dropReloadDatasource: datasource, dropReloadAction: 'reload' }),
+            this.setState({
+              datasourceToMarkSegmentsByIntervalIn: datasource,
+              useUnuseAction: 'use',
+            }),
         },
         {
           icon: IconNames.IMPORT,
-          title: 'Drop data by interval',
+          title: 'Mark as unused segments by interval',
+
           onAction: () =>
-            this.setState({ dropReloadDatasource: datasource, dropReloadAction: 'drop' }),
+            this.setState({
+              datasourceToMarkSegmentsByIntervalIn: datasource,
+              useUnuseAction: 'unuse',
+            }),
         },
         {
           icon: IconNames.IMPORT,
-          title: 'Drop datasource (disable)',
+          title: 'Mark as unused all segments',
           intent: Intent.DANGER,
-          onAction: () => this.setState({ dropDataDatasource: datasource }),
+          onAction: () => this.setState({ datasourceToMarkAsUnusedAllSegmentsIn: datasource }),
         },
         {
           icon: IconNames.TRASH,
@@ -657,7 +695,7 @@ GROUP BY 1`;
           intent: Intent.DANGER,
           onAction: () => this.setState({ killDatasource: datasource }),
         },
-      ];
+      ]);
     }
   }
 
@@ -694,19 +732,19 @@ GROUP BY 1`;
   }
 
   renderDatasourceTable() {
-    const { goToSegments, noSqlMode } = this.props;
+    const { goToSegments, capabilities } = this.props;
     const {
       datasources,
       defaultRules,
       datasourcesLoading,
       datasourcesError,
       datasourceFilter,
-      showDisabled,
+      showUnused,
       hiddenColumns,
     } = this.state;
     let data = datasources || [];
-    if (!showDisabled) {
-      data = data.filter(d => !d.disabled);
+    if (!showUnused) {
+      data = data.filter(d => !d.unused);
     }
     return (
       <>
@@ -755,13 +793,13 @@ GROUP BY 1`;
                 };
               },
               Cell: row => {
-                const { datasource, num_available_segments, num_segments, disabled } = row.original;
+                const { datasource, num_available_segments, num_segments, unused } = row.original;
 
-                if (disabled) {
+                if (unused) {
                   return (
                     <span>
-                      <span style={{ color: DatasourcesView.DISABLED_COLOR }}>&#x25cf;&nbsp;</span>
-                      Disabled
+                      <span style={{ color: DatasourcesView.UNUSED_COLOR }}>&#x25cf;&nbsp;</span>
+                      Unused
                     </span>
                   );
                 }
@@ -794,7 +832,7 @@ GROUP BY 1`;
                   return (
                     <span>
                       <span style={{ color: DatasourcesView.PARTIALLY_AVAILABLE_COLOR }}>
-                        &#x25cf;&nbsp;
+                        {num_available_segments ? '\u25cf' : '\u25cb'}&nbsp;
                       </span>
                       {percentAvailable}% available ({segmentsEl}, {segmentsMissingEl})
                     </span>
@@ -850,7 +888,7 @@ GROUP BY 1`;
                   </span>
                 );
               },
-              show: hiddenColumns.exists('Retention'),
+              show: capabilities.hasCoordinatorAccess() && hiddenColumns.exists('Retention'),
             },
             {
               Header: 'Replicated size',
@@ -858,7 +896,7 @@ GROUP BY 1`;
               filterable: false,
               width: 100,
               Cell: row => formatBytes(row.value),
-              show: hiddenColumns.exists('Replicated size'),
+              show: capabilities.hasSql() && hiddenColumns.exists('Replicated size'),
             },
             {
               Header: 'Size',
@@ -904,7 +942,7 @@ GROUP BY 1`;
                   </span>
                 );
               },
-              show: hiddenColumns.exists('Compaction'),
+              show: capabilities.hasCoordinatorAccess() && hiddenColumns.exists('Compaction'),
             },
             {
               Header: 'Avg. segment size',
@@ -920,7 +958,7 @@ GROUP BY 1`;
               filterable: false,
               width: 100,
               Cell: row => formatNumber(row.value),
-              show: !noSqlMode && hiddenColumns.exists('Num rows'),
+              show: capabilities.hasSql() && hiddenColumns.exists('Num rows'),
             },
             {
               Header: ACTION_COLUMN_LABEL,
@@ -930,10 +968,10 @@ GROUP BY 1`;
               filterable: false,
               Cell: row => {
                 const datasource = row.value;
-                const { disabled, rules, compaction } = row.original;
+                const { unused, rules, compaction } = row.original;
                 const datasourceActions = this.getDatasourceActions(
                   datasource,
-                  disabled,
+                  unused,
                   rules,
                   compaction,
                 );
@@ -954,9 +992,9 @@ GROUP BY 1`;
           ]}
           defaultPageSize={50}
         />
-        {this.renderDropDataAction()}
-        {this.renderEnableAction()}
-        {this.renderDropReloadAction()}
+        {this.renderUnuseAction()}
+        {this.renderUseAction()}
+        {this.renderUseUnuseActionByInterval()}
         {this.renderKillAction()}
         {this.renderRetentionDialog()}
         {this.renderCompactionDialog()}
@@ -965,9 +1003,9 @@ GROUP BY 1`;
   }
 
   render(): JSX.Element {
-    const { noSqlMode } = this.props;
+    const { capabilities } = this.props;
     const {
-      showDisabled,
+      showUnused,
       hiddenColumns,
       showChart,
       chartHeight,
@@ -992,14 +1030,16 @@ GROUP BY 1`;
             checked={showChart}
             label="Show segment timeline"
             onChange={() => this.setState({ showChart: !showChart })}
+            disabled={!capabilities.hasSqlOrCoordinatorAccess()}
           />
           <Switch
-            checked={showDisabled}
-            label="Show disabled"
-            onChange={() => this.toggleDisabled(showDisabled)}
+            checked={showUnused}
+            label="Show unused"
+            onChange={() => this.toggleUnused(showUnused)}
+            disabled={!capabilities.hasCoordinatorAccess()}
           />
           <TableColumnSelector
-            columns={noSqlMode ? tableColumnsNoSql : tableColumns}
+            columns={tableColumns[capabilities.getMode()]}
             onChange={column =>
               this.setState(prevState => ({
                 hiddenColumns: prevState.hiddenColumns.toggle(column),
@@ -1010,7 +1050,11 @@ GROUP BY 1`;
         </ViewControlBar>
         {showChart && (
           <div className={'chart-container'}>
-            <SegmentTimeline chartHeight={chartHeight} chartWidth={chartWidth} />
+            <SegmentTimeline
+              capabilities={capabilities}
+              chartHeight={chartHeight}
+              chartWidth={chartWidth}
+            />
           </div>
         )}
         {this.renderDatasourceTable()}

@@ -30,6 +30,7 @@ import { IconNames } from '@blueprintjs/icons';
 import classNames from 'classnames';
 import React, { ReactNode, useState } from 'react';
 
+import { WarningChecklist } from '../../components/warning-checklist/warning-checklist';
 import { AppToaster } from '../../singletons/toaster';
 
 import './async-action-dialog.scss';
@@ -46,10 +47,13 @@ export interface AsyncActionDialogProps {
   intent?: Intent;
   successText: string;
   failText: string;
+  warningChecks?: string[];
   children?: ReactNode;
 }
 
-export function AsyncActionDialog(props: AsyncActionDialogProps) {
+export const AsyncActionDialog = React.memo(function AsyncActionDialog(
+  props: AsyncActionDialogProps,
+) {
   const {
     action,
     onClose,
@@ -62,11 +66,16 @@ export function AsyncActionDialog(props: AsyncActionDialogProps) {
     confirmButtonText,
     confirmButtonDisabled,
     cancelButtonText,
+    warningChecks,
     children,
   } = props;
   const [working, setWorking] = useState(false);
+  const [allWarningsChecked, setAllWarningsChecked] = useState(false);
+  const needsMoreChecks = Boolean(warningChecks && !allWarningsChecked);
 
   async function handleConfirm() {
+    if (needsMoreChecks) return;
+
     setWorking(true);
     try {
       await action();
@@ -106,7 +115,12 @@ export function AsyncActionDialog(props: AsyncActionDialogProps) {
         ) : (
           <>
             {icon && <Icon icon={icon} />}
-            <div className={Classes.ALERT_CONTENTS}>{children}</div>
+            <div className={Classes.ALERT_CONTENTS}>
+              {children}
+              {warningChecks && (
+                <WarningChecklist checks={warningChecks} onChange={setAllWarningsChecked} />
+              )}
+            </div>
           </>
         )}
       </div>
@@ -119,7 +133,7 @@ export function AsyncActionDialog(props: AsyncActionDialogProps) {
               intent={intent}
               text={confirmButtonText}
               onClick={handleConfirm}
-              disabled={confirmButtonDisabled}
+              disabled={confirmButtonDisabled || needsMoreChecks}
             />
             <Button text={cancelButtonText || 'Cancel'} onClick={onClose} />
           </>
@@ -127,4 +141,4 @@ export function AsyncActionDialog(props: AsyncActionDialogProps) {
       </div>
     </Dialog>
   );
-}
+});

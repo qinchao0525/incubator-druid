@@ -21,10 +21,10 @@ package org.apache.druid.query.aggregation.datasketches.tuple;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
-import com.yahoo.sketches.quantiles.DoublesSketch;
-import com.yahoo.sketches.quantiles.UpdateDoublesSketch;
-import com.yahoo.sketches.tuple.ArrayOfDoublesSketch;
-import com.yahoo.sketches.tuple.ArrayOfDoublesSketchIterator;
+import org.apache.datasketches.quantiles.DoublesSketch;
+import org.apache.datasketches.quantiles.UpdateDoublesSketch;
+import org.apache.datasketches.tuple.ArrayOfDoublesSketch;
+import org.apache.datasketches.tuple.ArrayOfDoublesSketchIterator;
 import org.apache.druid.query.aggregation.AggregatorUtil;
 import org.apache.druid.query.aggregation.PostAggregator;
 import org.apache.druid.query.aggregation.datasketches.quantiles.DoublesSketchAggregatorFactory;
@@ -41,7 +41,7 @@ import java.util.Objects;
  * The column number is optional (the default is 1).
  * The parameter k is optional (the default is defined in the sketch library).
  * The result is a quantiles sketch.
- * See <a href=https://datasketches.github.io/docs/Quantiles/QuantilesOverview.html>Quantiles Sketch Overview</a>
+ * See <a href=https://datasketches.apache.org/docs/Quantiles/QuantilesOverview.html>Quantiles Sketch Overview</a>
  */
 public class ArrayOfDoublesSketchToQuantilesSketchPostAggregator extends ArrayOfDoublesSketchUnaryPostAggregator
 {

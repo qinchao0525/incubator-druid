@@ -17,18 +17,14 @@
  */
 
 import { render } from '@testing-library/react';
-import { sqlParserFactory } from 'druid-query-toolkit';
+import { parseSqlQuery } from 'druid-query-toolkit';
 import React from 'react';
-
-import { SQL_FUNCTIONS } from '../../../../lib/sql-docs';
 
 import { QueryOutput } from './query-output';
 
 describe('query output', () => {
   it('matches snapshot', () => {
-    const parser = sqlParserFactory(SQL_FUNCTIONS.map(sqlFunction => sqlFunction.name));
-
-    const parsedQuery = parser(`SELECT
+    const parsedQuery = parseSqlQuery(`SELECT
   "language",
   COUNT(*) AS "Count", COUNT(DISTINCT "language") AS "dist_language", COUNT(*) FILTER (WHERE "language"= 'xxx') AS "language_filtered_count"
 FROM "github"
@@ -49,40 +45,7 @@ ORDER BY "Count" DESC`);
             ['JavaScript', 166, 1, 0],
             ['Python', 62, 1, 0],
             ['HTML', 46, 1, 0],
-            ['Java', 42, 1, 0],
-            ['C++', 28, 1, 0],
-            ['Go', 24, 1, 0],
-            ['Ruby', 20, 1, 0],
-            ['C#', 14, 1, 0],
-            ['C', 13, 1, 0],
-            ['CSS', 13, 1, 0],
-            ['Shell', 12, 1, 0],
-            ['Makefile', 10, 1, 0],
-            ['PHP', 9, 1, 0],
-            ['Scala', 8, 1, 0],
-            ['HCL', 6, 1, 0],
-            ['Jupyter Notebook', 6, 1, 0],
-            ['Smarty', 4, 1, 0],
-            ['Elm', 4, 1, 0],
-            ['Roff', 3, 1, 0],
-            ['Dockerfile', 3, 1, 0],
-            ['Rust', 3, 1, 0],
-            ['Dart', 2, 1, 0],
-            ['LLVM', 2, 1, 0],
-            ['Objective-C', 2, 1, 0],
-            ['Julia', 2, 1, 0],
-            ['PowerShell', 2, 1, 0],
-            ['Swift', 2, 1, 0],
-            ['Nim', 2, 1, 0],
-            ['XSLT', 1, 1, 0],
-            ['Lua', 1, 1, 0],
-            ['Vim script', 1, 1, 0],
-            ['Vue', 1, 1, 0],
-            ['Lasso', 1, 1, 0],
-            ['Clojure', 1, 1, 0],
-            ['OCaml', 1, 1, 0],
-            ['Chapel', 1, 1, 0],
-            ['Kotlin', 1, 1, 0],
+            [],
           ],
         }}
         parsedQuery={parsedQuery}
